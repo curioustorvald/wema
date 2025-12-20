@@ -1,0 +1,68 @@
+# Build-related
+out/*
+bin/*
+build/*
+.gradle/*
+TerrarumBuild.jar
+My_BASIC_Programs/*
+buildapp/out/TerranBASIC*
+buildapp/TerranBASIC_linux.*
+buildapp/TerranBASIC_macOS.*
+buildapp/TerranBASIC_windows.*
+*.o
+*.a
+
+# Java native errors
+hs_err_pid*
+replay_pid*
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+.directory
+*/.directory
+
+# Resources that should not be tracked
+assets/mods/basegame/demoworld
+external_resource_packs
+#assets/mods/basegame/demoworld.gz
+external_resource_packs.zip
+
+# IntelliJ
+workspace.xml
+
+# Temporary files
+.tmp*
+tmp_*
+## Microsoft Office
+~$*
+## Generic temp files in Linux
+*~
+## Vim temp files
+*.swp
+*.swo
+## Kate temp swap file
+*.kate-swp
+
+# Eclipse MAT heap files
+*.hprof
+*.bin
+*.index
+*.threads
+*_Leak_Suspects.zip
+
+# TeX outputs
+*.aux
+*.log
+*.out
+tsvmman.pdf
+*.toc
+*.idx
+*.ilg
+*.ind
+
+assets/disk0/home/basic/*
+assets/disk0/movtestimg/*.jpg
+assets/disk0/*.mov
+assets/diskMediabin/*
