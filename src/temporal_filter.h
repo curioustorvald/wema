@@ -46,10 +46,12 @@ void temporal_buffer_push(TemporalBuffer *buf,
  * Apply temporal band-pass filter.
  * Returns filtered phase delta for amplification.
  * output: array [num_positions]
+ * bilateral: if true, use bilateral weighting to reduce noise
  */
 void temporal_filter_apply(const TemporalFilter *filt,
                            const TemporalBuffer *buf,
-                           float *delta_phi_filtered);
+                           float *delta_phi_filtered,
+                           bool bilateral);
 
 /*
  * Check if buffer has enough frames for filtering.

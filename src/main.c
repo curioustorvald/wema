@@ -21,13 +21,14 @@ static void print_usage(const char *prog) {
         "Options:\n"
         "  -i, --input <file>     Input video file (required)\n"
         "  -o, --output <file>    Output video file (default: input.wema.mkv)\n"
-        "  -a, --amp <factor>     Amplification factor (default: 10)\n"
+        "  -a, --amp <factor>     Amplification factor (default: 50)\n"
         "  --fl <freq>            Low frequency cutoff in Hz (default: 0.5)\n"
         "  --fh <freq>            High frequency cutoff in Hz (default: 3.0)\n"
         "  --ff-codec <codec>     FFmpeg video codec (default: ffv1)\n"
         "  --ff-option <opts>     FFmpeg encoder options\n"
+        "  --temporal-window <n>  Temporal window size (default: 32, min:4, max: 256)\n"
         "  --no-edge-aware        Disable edge-aware guided filter\n"
-        "  --no-spatial-smooth    Disable spatial smoothing of wavelet deltas\n"
+        "  --no-bilateral         Disable bilateral temporal filtering\n"
         "  -v, --verbose          Verbose output\n"
         "  -h, --help             Show this help\n"
         "\n"
@@ -58,12 +59,13 @@ static char *generate_output_path(const char *input) {
 static int parse_args(int argc, char **argv, WemaConfig *config) {
     /* Set defaults */
     memset(config, 0, sizeof(*config));
-    config->amp_factor = 10.0f;
+    config->amp_factor = 50.0f;
     config->f_low = 0.5f;
     config->f_high = 3.0f;
+    config->temporal_window = WEMA_TEMPORAL_WINDOW_DEF;
     config->verbose = false;
-    config->edge_aware = true;     /* Enabled by default */
-    config->spatial_smooth = true; /* Enabled by default */
+    config->edge_aware = true;       /* Enabled by default */
+    config->bilateral_temp = true;   /* Enabled by default */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--input") == 0) {
@@ -113,6 +115,22 @@ static int parse_args(int argc, char **argv, WemaConfig *config) {
                 return -1;
             }
         }
+        else if (strcmp(argv[i], "--temporal-window") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: --temporal-window requires an argument\n");
+                return -1;
+            }
+            config->temporal_window = atoi(argv[i]);
+            if (config->temporal_window < 4) {
+                fprintf(stderr, "Error: temporal window must be at least 4\n");
+                return -1;
+            }
+            if (config->temporal_window > WEMA_TEMPORAL_WINDOW_MAX) {
+                fprintf(stderr, "Error: temporal window cannot exceed %d\n",
+                        WEMA_TEMPORAL_WINDOW_MAX);
+                return -1;
+            }
+        }
         else if (strcmp(argv[i], "--ff-codec") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "Error: --ff-codec requires an argument\n");
@@ -133,8 +151,8 @@ static int parse_args(int argc, char **argv, WemaConfig *config) {
         else if (strcmp(argv[i], "--no-edge-aware") == 0) {
             config->edge_aware = false;
         }
-        else if (strcmp(argv[i], "--no-spatial-smooth") == 0) {
-            config->spatial_smooth = false;
+        else if (strcmp(argv[i], "--no-bilateral") == 0) {
+            config->bilateral_temp = false;
         }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
@@ -197,21 +215,23 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Settings:\n");
         fprintf(stderr, "  Amplification: %.1f\n", config.amp_factor);
         fprintf(stderr, "  Frequency band: %.2f - %.2f Hz\n", config.f_low, config.f_high);
+        fprintf(stderr, "  Temporal window: %d frames\n", config.temporal_window);
+        fprintf(stderr, "  Bilateral temporal: %s\n", config.bilateral_temp ? "enabled" : "disabled");
         fprintf(stderr, "  Edge-aware filter: %s\n", config.edge_aware ? "enabled" : "disabled");
-        fprintf(stderr, "  Spatial smoothing: %s\n", config.spatial_smooth ? "enabled" : "disabled");
     }
 
     /* Initialize WEMA context */
     WemaContext ctx;
     if (wema_init(&ctx, io_in.width, io_in.height, io_in.fps,
-                  config.amp_factor, config.f_low, config.f_high) < 0) {
+                  config.amp_factor, config.f_low, config.f_high,
+                  config.temporal_window) < 0) {
         fprintf(stderr, "Error: Failed to initialize WEMA\n");
         ffio_close_input(&io_in);
         mem_free(auto_output);
         return 1;
     }
     ctx.edge_aware = config.edge_aware;
-    ctx.spatial_smooth = config.spatial_smooth;
+    ctx.bilateral_temp = config.bilateral_temp;
 
     /* Open output */
     FFmpegIO io_out = {0};

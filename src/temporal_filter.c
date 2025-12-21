@@ -183,7 +183,8 @@ void temporal_buffer_push(TemporalBuffer *buf,
 
 void temporal_filter_apply(const TemporalFilter *filt,
                            const TemporalBuffer *buf,
-                           float *delta_phi_filtered) {
+                           float *delta_phi_filtered,
+                           bool bilateral) {
     if (buf->filled < buf->window_size) {
         /* Not enough data yet */
         memset(delta_phi_filtered, 0, buf->num_positions * sizeof(float));
@@ -193,8 +194,9 @@ void temporal_filter_apply(const TemporalFilter *filt,
     int ws = buf->window_size;
     int center = ws / 2;
 
-    /* Allocate work buffer for temporal DWT */
+    /* Allocate work buffers */
     float *temp = mem_alloc(ws * sizeof(float));
+    float *weights = bilateral ? mem_alloc(ws * sizeof(float)) : NULL;
     if (!temp) {
         memset(delta_phi_filtered, 0, buf->num_positions * sizeof(float));
         return;
@@ -214,6 +216,7 @@ void temporal_filter_apply(const TemporalFilter *filt,
     bool *keep_level = mem_alloc(num_levels * sizeof(bool));
     if (!keep_level) {
         mem_free(temp);
+        mem_free(weights);
         memset(delta_phi_filtered, 0, buf->num_positions * sizeof(float));
         return;
     }
@@ -227,6 +230,9 @@ void temporal_filter_apply(const TemporalFilter *filt,
                          f_low_scale <= filt->f_high_norm);
     }
 
+    /* For bilateral: second buffer to store bandpass-filtered results */
+    float *bandpass_buf = bilateral ? mem_alloc(ws * sizeof(float)) : NULL;
+
     for (size_t pos = 0; pos < buf->num_positions; pos++) {
         /* Extract coefficient history from circular buffer */
         size_t base = pos * ws;
@@ -237,7 +243,9 @@ void temporal_filter_apply(const TemporalFilter *filt,
             temp[t] = buf->phase_buffer[base + idx];
         }
 
-        /* Remove DC (mean value) - we only want the temporal variations */
+        float current_val = temp[center];
+
+        /* Standard DC removal */
         float mean = 0.0f;
         for (int t = 0; t < ws; t++) {
             mean += temp[t];
@@ -270,11 +278,69 @@ void temporal_filter_apply(const TemporalFilter *filt,
         /* Inverse DWT */
         haar_idwt_1d(temp, ws);
 
-        /* Extract center sample (current frame with half-window latency) */
-        delta_phi_filtered[pos] = temp[center];
+        if (bilateral && weights && bandpass_buf) {
+            /*
+             * Bilateral temporal filtering on bandpass output:
+             * Weight each bandpass-filtered time sample by how similar
+             * the original coefficient was to the current frame.
+             * This preserves coherent motion while averaging out noise.
+             */
+
+            /* Re-extract original coefficients for similarity comparison */
+            for (int t = 0; t < ws; t++) {
+                int idx = (start + t) % ws;
+                bandpass_buf[t] = buf->phase_buffer[base + idx];
+            }
+
+            /* Compute MAD (median absolute deviation) for robust sigma estimate */
+            float median_approx = current_val;  /* Use current as reference */
+            float mad_sum = 0.0f;
+            for (int t = 0; t < ws; t++) {
+                float dev = bandpass_buf[t] - median_approx;
+                mad_sum += (dev > 0) ? dev : -dev;
+            }
+            float mad = mad_sum / (float)ws;
+
+            /* Sigma: smaller = more aggressive noise rejection
+             * Use MAD-based estimate, with minimum floor */
+            float sigma = fmaxf(mad * 0.5f, 0.001f);
+            float sigma_sq = sigma * sigma;
+
+            /* Compute bilateral weights based on coefficient similarity */
+            float weight_sum = 0.0f;
+            for (int t = 0; t < ws; t++) {
+                float diff = bandpass_buf[t] - current_val;
+                float range_weight = expf(-(diff * diff) / (2.0f * sigma_sq));
+
+                /* Temporal proximity weight - closer frames weighted more */
+                float time_diff = (float)(t - center);
+                float time_sigma = (float)ws * 0.15f;  /* Tighter temporal window */
+                float time_weight = expf(-(time_diff * time_diff) / (2.0f * time_sigma * time_sigma));
+
+                weights[t] = range_weight * time_weight;
+                weight_sum += weights[t];
+            }
+
+            /* Weighted average of bandpass-filtered outputs */
+            if (weight_sum > 1e-8f) {
+                float weighted_output = 0.0f;
+                for (int t = 0; t < ws; t++) {
+                    weighted_output += (weights[t] / weight_sum) * temp[t];
+                }
+                delta_phi_filtered[pos] = weighted_output;
+            } else {
+                delta_phi_filtered[pos] = temp[center];
+            }
+        } else {
+            /* Non-bilateral: just take center sample */
+            delta_phi_filtered[pos] = temp[center];
+        }
     }
 
+    mem_free(bandpass_buf);
+
     mem_free(keep_level);
+    mem_free(weights);
     mem_free(temp);
 }
 

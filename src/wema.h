@@ -14,9 +14,10 @@
  * Configuration Constants
  *===========================================================================*/
 
-#define WEMA_MAX_LEVELS       4    /* Maximum DT-CWT decomposition levels */
-#define WEMA_NUM_ORIENTATIONS 6    /* 2D DT-CWT orientations per level */
-#define WEMA_TEMPORAL_WINDOW  32   /* Sliding window size (power of 2) */
+#define WEMA_MAX_LEVELS          4    /* Maximum DT-CWT decomposition levels */
+#define WEMA_NUM_ORIENTATIONS    6    /* 2D DT-CWT orientations per level */
+#define WEMA_TEMPORAL_WINDOW_DEF 32   /* Default sliding window size */
+#define WEMA_TEMPORAL_WINDOW_MAX 256  /* Maximum sliding window size */
 
 /*============================================================================
  * Complex Number Type
@@ -116,8 +117,9 @@ typedef struct {
     float  f_low;           /* Low frequency cutoff (Hz) */
     float  f_high;          /* High frequency cutoff (Hz) */
     int    num_levels;      /* DT-CWT decomposition levels */
+    int    temporal_window; /* Temporal sliding window size */
     bool   edge_aware;      /* Use edge-aware guided filter */
-    bool   spatial_smooth;  /* Smooth wavelet deltas spatially */
+    bool   bilateral_temp;  /* Bilateral temporal filtering */
 
     /* Normalized frequencies */
     float  f_low_norm;
@@ -175,13 +177,14 @@ typedef struct {
     float   amp_factor;     /* Default: 10.0 */
     float   f_low;          /* Default: 0.5 Hz */
     float   f_high;         /* Default: 3.0 Hz */
+    int     temporal_window;/* Default: 32, higher = better freq resolution */
 
     char   *ff_codec;       /* Default: "ffv1" */
     char   *ff_options;     /* Default: NULL */
 
     bool    verbose;
     bool    edge_aware;     /* Default: true (use guided filter) */
-    bool    spatial_smooth; /* Default: true (smooth wavelet deltas) */
+    bool    bilateral_temp; /* Default: true (bilateral temporal filtering) */
 } WemaConfig;
 
 /*============================================================================
@@ -189,7 +192,8 @@ typedef struct {
  *===========================================================================*/
 
 int  wema_init(WemaContext *ctx, int width, int height, float fps,
-               float amp_factor, float f_low, float f_high);
+               float amp_factor, float f_low, float f_high,
+               int temporal_window);
 void wema_free(WemaContext *ctx);
 int  wema_process_frame(WemaContext *ctx, const Frame *in, Frame *out);
 int  wema_flush(WemaContext *ctx, Frame *out);

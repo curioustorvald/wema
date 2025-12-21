@@ -14,13 +14,11 @@
  * orig_coeff: original coefficient values [num_positions]
  * alpha: amplification factor
  * coeffs: DT-CWT coefficients to modify in-place
- * spatial_smooth: apply 3x3 smoothing to delta coefficients
  */
 void phase_amplify(const float *delta_coeff,
                    const float *orig_coeff,
                    float alpha,
-                   DTCWTCoeffs *coeffs,
-                   bool spatial_smooth);
+                   DTCWTCoeffs *coeffs);
 
 /*
  * Optional amplitude thresholding.

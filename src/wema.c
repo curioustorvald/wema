@@ -296,7 +296,8 @@ void frame_gray_to_rgb(const float *gray, const Frame *orig, Frame *out,
  *===========================================================================*/
 
 int wema_init(WemaContext *ctx, int width, int height, float fps,
-              float amp_factor, float f_low, float f_high) {
+              float amp_factor, float f_low, float f_high,
+              int temporal_window) {
     memset(ctx, 0, sizeof(*ctx));
 
     ctx->width = width;
@@ -305,8 +306,9 @@ int wema_init(WemaContext *ctx, int width, int height, float fps,
     ctx->amp_factor = amp_factor;
     ctx->f_low = f_low;
     ctx->f_high = f_high;
-    ctx->edge_aware = true;     /* Enable by default */
-    ctx->spatial_smooth = true; /* Enable by default */
+    ctx->temporal_window = temporal_window;
+    ctx->edge_aware = true;       /* Enable by default */
+    ctx->bilateral_temp = true;   /* Enable by default */
 
     /* Compute normalized frequencies */
     ctx->f_low_norm = f_low / (fps / 2.0f);
@@ -332,7 +334,7 @@ int wema_init(WemaContext *ctx, int width, int height, float fps,
     if (!ctx->temporal_buf) goto error;
 
     if (temporal_buffer_init(ctx->temporal_buf, ctx->coeffs,
-                             WEMA_TEMPORAL_WINDOW) < 0) {
+                             ctx->temporal_window) < 0) {
         goto error;
     }
 
@@ -342,7 +344,7 @@ int wema_init(WemaContext *ctx, int width, int height, float fps,
 
     if (temporal_filter_init(ctx->temporal_filt,
                              ctx->f_low_norm, ctx->f_high_norm,
-                             WEMA_TEMPORAL_WINDOW) < 0) {
+                             ctx->temporal_window) < 0) {
         goto error;
     }
 
@@ -431,12 +433,13 @@ int wema_process_frame(WemaContext *ctx, const Frame *in, Frame *out) {
         return 0;
     }
 
-    /* Step 4: Temporal band-pass filtering */
-    temporal_filter_apply(ctx->temporal_filt, ctx->temporal_buf, ctx->delta_phi);
+    /* Step 4: Temporal band-pass filtering (with optional bilateral) */
+    temporal_filter_apply(ctx->temporal_filt, ctx->temporal_buf, ctx->delta_phi,
+                          ctx->bilateral_temp);
 
     /* Step 5: Phase amplification */
     phase_amplify(ctx->delta_phi, ctx->temporal_buf->amplitude,
-                  ctx->amp_factor, ctx->coeffs, ctx->spatial_smooth);
+                  ctx->amp_factor, ctx->coeffs);
 
     /* Step 6: DT-CWT inverse transform */
     dtcwt_inverse(ctx->coeffs, ctx->gray_out);
