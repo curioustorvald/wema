@@ -1,12 +1,11 @@
 /*
- * WEMA - Dual-Tree Complex Wavelet Transform
+ * WEMA - Spatial Wavelet Transform
  *
- * Simplified implementation using Haar wavelets for spatial decomposition.
- * Creates pseudo-complex coefficients using horizontal/vertical separation.
+ * Implementation using CDF 9/7 biorthogonal wavelets via lifting scheme.
+ * Uses standard dyadic decomposition with uniform subband sizes.
  */
 
 #include "dtcwt.h"
-#include "dtcwt_filters.h"
 #include "complex_math.h"
 #include "alloc.h"
 
@@ -15,107 +14,200 @@
 #include <math.h>
 
 /*============================================================================
- * Simple Haar DWT (guaranteed perfect reconstruction)
+ * CDF 9/7 Lifting Coefficients
  *===========================================================================*/
 
-/* 2D Haar forward transform - one level */
-static void haar_2d_forward(const float *input, int width, int height,
-                            float *ll, float *lh, float *hl, float *hh,
-                            int out_w, int out_h) {
-    for (int y = 0; y < out_h; y++) {
-        for (int x = 0; x < out_w; x++) {
-            int y2 = y * 2;
-            int x2 = x * 2;
+#define ALPHA -1.586134342059924f
+#define BETA  -0.052980118572961f
+#define GAMMA  0.882911075530934f
+#define DELTA  0.443506852043971f
+#define K      1.149604398860241f
+#define K_INV  (1.0f / K)
 
-            /* Get 2x2 block with boundary handling */
-            float a = input[y2 * width + x2];
-            float b = (x2 + 1 < width) ? input[y2 * width + x2 + 1] : a;
-            float c = (y2 + 1 < height) ? input[(y2 + 1) * width + x2] : a;
-            float d = (x2 + 1 < width && y2 + 1 < height) ?
-                      input[(y2 + 1) * width + x2 + 1] :
-                      ((y2 + 1 < height) ? c : b);
+/*============================================================================
+ * 1D CDF 9/7 Lifting Implementation
+ *===========================================================================*/
 
-            /* 2D Haar transform */
-            ll[y * out_w + x] = (a + b + c + d) * 0.25f;  /* Average */
-            lh[y * out_w + x] = (a + b - c - d) * 0.25f;  /* Horizontal edge */
-            hl[y * out_w + x] = (a - b + c - d) * 0.25f;  /* Vertical edge */
-            hh[y * out_w + x] = (a - b - c + d) * 0.25f;  /* Diagonal */
-        }
+static void cdf97_fwd_1d(float *data, int n, float *temp) {
+    if (n < 2) return;
+
+    int half = (n + 1) / 2;
+    int odd_n = n / 2;
+
+    memcpy(temp, data, n * sizeof(float));
+
+    /* Predict 1 */
+    for (int i = 0; i < odd_n; i++) {
+        int right = (2*i+2 < n) ? 2*i+2 : 2*i;
+        temp[2*i+1] += ALPHA * (temp[2*i] + temp[right]);
     }
+
+    /* Update 1 */
+    for (int i = 0; i < half; i++) {
+        int left = (i > 0) ? 2*i-1 : 1;
+        int right = (2*i+1 < n) ? 2*i+1 : left;
+        if (odd_n > 0)
+            temp[2*i] += BETA * (temp[left] + temp[right]);
+    }
+
+    /* Predict 2 */
+    for (int i = 0; i < odd_n; i++) {
+        int right = (2*i+2 < n) ? 2*i+2 : 2*i;
+        temp[2*i+1] += GAMMA * (temp[2*i] + temp[right]);
+    }
+
+    /* Update 2 */
+    for (int i = 0; i < half; i++) {
+        int left = (i > 0) ? 2*i-1 : 1;
+        int right = (2*i+1 < n) ? 2*i+1 : left;
+        if (odd_n > 0)
+            temp[2*i] += DELTA * (temp[left] + temp[right]);
+    }
+
+    /* Scale and pack */
+    for (int i = 0; i < half; i++)
+        data[i] = temp[2*i] * K_INV;
+    for (int i = 0; i < odd_n; i++)
+        data[half + i] = temp[2*i+1] * K;
 }
 
-/* 2D Haar inverse transform - one level */
-static void haar_2d_inverse(const float *ll, const float *lh,
-                            const float *hl, const float *hh,
-                            int in_w, int in_h,
-                            float *output, int out_w, int out_h) {
-    for (int y = 0; y < in_h; y++) {
-        for (int x = 0; x < in_w; x++) {
-            float l = ll[y * in_w + x];
-            float h1 = lh[y * in_w + x];
-            float h2 = hl[y * in_w + x];
-            float h3 = hh[y * in_w + x];
+static void cdf97_inv_1d(float *data, int n, float *temp) {
+    if (n < 2) return;
 
-            /* Inverse 2D Haar */
-            float a = l + h1 + h2 + h3;
-            float b = l + h1 - h2 - h3;
-            float c = l - h1 + h2 - h3;
-            float d = l - h1 - h2 + h3;
+    int half = (n + 1) / 2;
+    int odd_n = n / 2;
 
-            int y2 = y * 2;
-            int x2 = x * 2;
+    /* Unpack and unscale */
+    for (int i = 0; i < half; i++)
+        temp[2*i] = data[i] * K;
+    for (int i = 0; i < odd_n; i++)
+        temp[2*i+1] = data[half + i] * K_INV;
 
-            if (y2 < out_h && x2 < out_w)
-                output[y2 * out_w + x2] = a;
-            if (y2 < out_h && x2 + 1 < out_w)
-                output[y2 * out_w + x2 + 1] = b;
-            if (y2 + 1 < out_h && x2 < out_w)
-                output[(y2 + 1) * out_w + x2] = c;
-            if (y2 + 1 < out_h && x2 + 1 < out_w)
-                output[(y2 + 1) * out_w + x2 + 1] = d;
-        }
+    /* Inverse update 2 */
+    for (int i = 0; i < half; i++) {
+        int left = (i > 0) ? 2*i-1 : 1;
+        int right = (2*i+1 < n) ? 2*i+1 : left;
+        if (odd_n > 0)
+            temp[2*i] -= DELTA * (temp[left] + temp[right]);
     }
+
+    /* Inverse predict 2 */
+    for (int i = 0; i < odd_n; i++) {
+        int right = (2*i+2 < n) ? 2*i+2 : 2*i;
+        temp[2*i+1] -= GAMMA * (temp[2*i] + temp[right]);
+    }
+
+    /* Inverse update 1 */
+    for (int i = 0; i < half; i++) {
+        int left = (i > 0) ? 2*i-1 : 1;
+        int right = (2*i+1 < n) ? 2*i+1 : left;
+        if (odd_n > 0)
+            temp[2*i] -= BETA * (temp[left] + temp[right]);
+    }
+
+    /* Inverse predict 1 */
+    for (int i = 0; i < odd_n; i++) {
+        int right = (2*i+2 < n) ? 2*i+2 : 2*i;
+        temp[2*i+1] -= ALPHA * (temp[2*i] + temp[right]);
+    }
+
+    memcpy(data, temp, n * sizeof(float));
 }
 
 /*============================================================================
- * Create complex coefficients from real subbands
- *
- * Use LH (horizontal) and HL (vertical) to create oriented complex coefficients.
- * This is a simplified version that creates 6 orientations from the subbands.
+ * 2D Separable Transform with uniform subband sizes
  *===========================================================================*/
 
-/* Store real subbands directly in complex format for now */
-static void create_complex_subbands(const float *lh, const float *hl, const float *hh,
-                                    int w, int h, Subband *subbands) {
-    int n = w * h;
-
-    for (int o = 0; o < WEMA_NUM_ORIENTATIONS; o++) {
-        subbands[o].width = w;
-        subbands[o].height = h;
+static void cdf97_2d_forward(float *img, int w, int h,
+                             float *ll, float *lh, float *hl, float *hh,
+                             int sub_w, int sub_h, float *temp) {
+    /* Transform rows in-place */
+    for (int y = 0; y < h; y++) {
+        cdf97_fwd_1d(img + y * w, w, temp);
     }
 
-    for (int i = 0; i < n; i++) {
-        /* Store subbands directly - real in .re, zero in .im */
-        /* This allows phase extraction to work on edge magnitudes */
-        subbands[0].coeffs[i] = cmplx(lh[i], 0.001f * lh[i]); /* horizontal */
-        subbands[1].coeffs[i] = cmplx(hh[i], 0.001f * hh[i]); /* diagonal */
-        subbands[2].coeffs[i] = cmplx(hl[i], 0.001f * hl[i]); /* vertical */
-        subbands[3].coeffs[i] = subbands[2].coeffs[i];
-        subbands[4].coeffs[i] = subbands[1].coeffs[i];
-        subbands[5].coeffs[i] = subbands[0].coeffs[i];
+    /* Transform columns - need to gather/scatter */
+    float *col = mem_alloc(h * sizeof(float));
+    if (!col) return;
+
+    for (int x = 0; x < w; x++) {
+        for (int y = 0; y < h; y++)
+            col[y] = img[y * w + x];
+        cdf97_fwd_1d(col, h, temp);
+        for (int y = 0; y < h; y++)
+            img[y * w + x] = col[y];
+    }
+    mem_free(col);
+
+    /* Extract subbands - after 2D transform:
+     * [LL | HL]   top-left is LL (low freq both dims)
+     * [LH | HH]   top-right is HL (high freq in X)
+     *             bottom-left is LH (high freq in Y)
+     *             bottom-right is HH (high freq both)
+     */
+    int hw = (w + 1) / 2;  /* lowpass width */
+    int hh_dim = (h + 1) / 2;  /* lowpass height */
+
+    for (int y = 0; y < sub_h; y++) {
+        for (int x = 0; x < sub_w; x++) {
+            ll[y * sub_w + x] = img[y * w + x];
+            if (x < w - hw && y < sub_h)
+                hl[y * sub_w + x] = img[y * w + hw + x];
+            if (y < h - hh_dim && x < sub_w)
+                lh[y * sub_w + x] = img[(hh_dim + y) * w + x];
+            if (x < w - hw && y < h - hh_dim)
+                hh[y * sub_w + x] = img[(hh_dim + y) * w + hw + x];
+        }
     }
 }
 
-static void extract_real_subbands(const Subband *subbands,
-                                  float *lh, float *hl, float *hh,
-                                  int w, int h) {
-    int n = w * h;
+static void cdf97_2d_inverse(const float *ll, const float *lh,
+                             const float *hl, const float *hh,
+                             int sub_w, int sub_h,
+                             float *img, int w, int h, float *temp) {
+    int hw = (w + 1) / 2;
+    int hh_dim = (h + 1) / 2;
 
-    for (int i = 0; i < n; i++) {
-        /* Extract real parts */
-        lh[i] = subbands[0].coeffs[i].re;
-        hl[i] = subbands[2].coeffs[i].re;
-        hh[i] = subbands[1].coeffs[i].re;
+    /* Pack subbands back into image layout */
+    memset(img, 0, w * h * sizeof(float));
+
+    for (int y = 0; y < sub_h && y < hh_dim; y++) {
+        for (int x = 0; x < sub_w && x < hw; x++) {
+            img[y * w + x] = ll[y * sub_w + x];
+        }
+    }
+    for (int y = 0; y < sub_h && y < hh_dim; y++) {
+        for (int x = 0; x < sub_w && x < w - hw; x++) {
+            img[y * w + hw + x] = hl[y * sub_w + x];
+        }
+    }
+    for (int y = 0; y < sub_h && y < h - hh_dim; y++) {
+        for (int x = 0; x < sub_w && x < hw; x++) {
+            img[(hh_dim + y) * w + x] = lh[y * sub_w + x];
+        }
+    }
+    for (int y = 0; y < sub_h && y < h - hh_dim; y++) {
+        for (int x = 0; x < sub_w && x < w - hw; x++) {
+            img[(hh_dim + y) * w + hw + x] = hh[y * sub_w + x];
+        }
+    }
+
+    /* Inverse transform columns */
+    float *col = mem_alloc(h * sizeof(float));
+    if (!col) return;
+
+    for (int x = 0; x < w; x++) {
+        for (int y = 0; y < h; y++)
+            col[y] = img[y * w + x];
+        cdf97_inv_1d(col, h, temp);
+        for (int y = 0; y < h; y++)
+            img[y * w + x] = col[y];
+    }
+    mem_free(col);
+
+    /* Inverse transform rows */
+    for (int y = 0; y < h; y++) {
+        cdf97_inv_1d(img + y * w, w, temp);
     }
 }
 
@@ -158,7 +250,6 @@ int dtcwt_init(DTCWTCoeffs *coeffs, int width, int height, int num_levels) {
         }
     }
 
-    /* Lowpass residual */
     coeffs->lowpass_w = w;
     coeffs->lowpass_h = h;
     coeffs->lowpass = mem_calloc(w * h, sizeof(float));
@@ -183,75 +274,66 @@ void dtcwt_free(DTCWTCoeffs *coeffs) {
 
 void dtcwt_forward(const float *image, int width, int height,
                    DTCWTCoeffs *coeffs) {
-    /* Allocate work buffers */
     size_t max_size = (size_t)width * height;
-    float *current = mem_alloc(max_size * sizeof(float));
+    float *work = mem_alloc(max_size * sizeof(float));
     float *ll = mem_alloc(max_size * sizeof(float));
     float *lh = mem_alloc(max_size * sizeof(float));
     float *hl = mem_alloc(max_size * sizeof(float));
     float *hh = mem_alloc(max_size * sizeof(float));
+    int max_dim = (width > height) ? width : height;
+    float *temp = mem_alloc(max_dim * sizeof(float));
 
-    if (!current || !ll || !lh || !hl || !hh) {
-        mem_free(current);
+    if (!work || !ll || !lh || !hl || !hh || !temp) {
+        mem_free(work);
         mem_free(ll);
         mem_free(lh);
         mem_free(hl);
         mem_free(hh);
+        mem_free(temp);
         return;
     }
 
-    /* Copy input */
-    memcpy(current, image, width * height * sizeof(float));
+    memcpy(work, image, width * height * sizeof(float));
 
     int cur_w = width;
     int cur_h = height;
 
     for (int lev = 0; lev < coeffs->num_levels; lev++) {
-        int out_w = (cur_w + 1) / 2;
-        int out_h = (cur_h + 1) / 2;
+        int sub_w = (cur_w + 1) / 2;
+        int sub_h = (cur_h + 1) / 2;
 
-        /* Haar forward transform */
-        haar_2d_forward(current, cur_w, cur_h, ll, lh, hl, hh, out_w, out_h);
+        cdf97_2d_forward(work, cur_w, cur_h, ll, lh, hl, hh, sub_w, sub_h, temp);
 
-        /* Create complex subbands */
-        create_complex_subbands(lh, hl, hh, out_w, out_h, coeffs->subbands[lev]);
+        /* Store in complex subbands */
+        int n = sub_w * sub_h;
+        for (int i = 0; i < n; i++) {
+            coeffs->subbands[lev][0].coeffs[i] = cmplx(lh[i], 0.001f * lh[i]);
+            coeffs->subbands[lev][1].coeffs[i] = cmplx(hh[i], 0.001f * hh[i]);
+            coeffs->subbands[lev][2].coeffs[i] = cmplx(hl[i], 0.001f * hl[i]);
+            /* Mirror for 6 orientations */
+            coeffs->subbands[lev][3].coeffs[i] = coeffs->subbands[lev][2].coeffs[i];
+            coeffs->subbands[lev][4].coeffs[i] = coeffs->subbands[lev][1].coeffs[i];
+            coeffs->subbands[lev][5].coeffs[i] = coeffs->subbands[lev][0].coeffs[i];
+        }
 
-        /* Copy lowpass for next level */
-        memcpy(current, ll, out_w * out_h * sizeof(float));
-        cur_w = out_w;
-        cur_h = out_h;
+        /* Next level operates on LL */
+        memcpy(work, ll, sub_w * sub_h * sizeof(float));
+        cur_w = sub_w;
+        cur_h = sub_h;
     }
 
-    /* Store final lowpass */
-    memcpy(coeffs->lowpass, current, cur_w * cur_h * sizeof(float));
+    memcpy(coeffs->lowpass, work, cur_w * cur_h * sizeof(float));
 
-    mem_free(current);
+    mem_free(work);
     mem_free(ll);
     mem_free(lh);
     mem_free(hl);
     mem_free(hh);
+    mem_free(temp);
 }
 
 void dtcwt_inverse(const DTCWTCoeffs *coeffs, float *image) {
-    /* Allocate work buffers */
-    size_t max_size = (size_t)coeffs->orig_width * coeffs->orig_height;
-    float *current = mem_alloc(max_size * sizeof(float));
-    float *lh = mem_alloc(max_size * sizeof(float));
-    float *hl = mem_alloc(max_size * sizeof(float));
-    float *hh = mem_alloc(max_size * sizeof(float));
-    float *output = mem_alloc(max_size * sizeof(float));
-
-    if (!current || !lh || !hl || !hh || !output) {
-        mem_free(current);
-        mem_free(lh);
-        mem_free(hl);
-        mem_free(hh);
-        mem_free(output);
-        return;
-    }
-
-    /* Precompute the input dimensions at each level during forward transform.
-     * This is needed because (w+1)/2 * 2 != w when w is odd. */
+    /* Precompute level dimensions */
     int level_w[WEMA_MAX_LEVELS + 1];
     int level_h[WEMA_MAX_LEVELS + 1];
     level_w[0] = coeffs->orig_width;
@@ -261,40 +343,57 @@ void dtcwt_inverse(const DTCWTCoeffs *coeffs, float *image) {
         level_h[lev] = (level_h[lev - 1] + 1) / 2;
     }
 
-    /* Start with the coarsest lowpass */
-    int cur_w = coeffs->lowpass_w;
-    int cur_h = coeffs->lowpass_h;
-    memcpy(current, coeffs->lowpass, cur_w * cur_h * sizeof(float));
+    size_t max_size = (size_t)coeffs->orig_width * coeffs->orig_height;
+    float *work = mem_alloc(max_size * sizeof(float));
+    float *output = mem_alloc(max_size * sizeof(float));
+    float *lh = mem_alloc(max_size * sizeof(float));
+    float *hl = mem_alloc(max_size * sizeof(float));
+    float *hh = mem_alloc(max_size * sizeof(float));
+    int max_dim = (coeffs->orig_width > coeffs->orig_height) ?
+                   coeffs->orig_width : coeffs->orig_height;
+    float *temp = mem_alloc(max_dim * sizeof(float));
+
+    if (!work || !output || !lh || !hl || !hh || !temp) {
+        mem_free(work);
+        mem_free(output);
+        mem_free(lh);
+        mem_free(hl);
+        mem_free(hh);
+        mem_free(temp);
+        return;
+    }
+
+    /* Start with coarsest lowpass */
+    memcpy(work, coeffs->lowpass, coeffs->lowpass_w * coeffs->lowpass_h * sizeof(float));
 
     /* Reconstruct from coarsest to finest */
     for (int lev = coeffs->num_levels - 1; lev >= 0; lev--) {
-        int sub_w = coeffs->subbands[lev][0].width;
-        int sub_h = coeffs->subbands[lev][0].height;
-
-        /* Extract real subbands from complex */
-        extract_real_subbands(coeffs->subbands[lev], lh, hl, hh, sub_w, sub_h);
-
-        /* Output size is the input size to this level during forward transform */
         int out_w = level_w[lev];
         int out_h = level_h[lev];
+        int sub_w = level_w[lev + 1];
+        int sub_h = level_h[lev + 1];
 
-        /* Haar inverse transform */
-        haar_2d_inverse(current, lh, hl, hh, sub_w, sub_h, output, out_w, out_h);
+        /* Extract real parts from complex subbands */
+        int n = sub_w * sub_h;
+        for (int i = 0; i < n; i++) {
+            lh[i] = coeffs->subbands[lev][0].coeffs[i].re;
+            hh[i] = coeffs->subbands[lev][1].coeffs[i].re;
+            hl[i] = coeffs->subbands[lev][2].coeffs[i].re;
+        }
 
-        /* Prepare for next level */
-        memcpy(current, output, out_w * out_h * sizeof(float));
-        cur_w = out_w;
-        cur_h = out_h;
+        cdf97_2d_inverse(work, lh, hl, hh, sub_w, sub_h, output, out_w, out_h, temp);
+
+        memcpy(work, output, out_w * out_h * sizeof(float));
     }
 
-    /* Copy final result */
-    memcpy(image, current, coeffs->orig_width * coeffs->orig_height * sizeof(float));
+    memcpy(image, work, coeffs->orig_width * coeffs->orig_height * sizeof(float));
 
-    mem_free(current);
+    mem_free(work);
+    mem_free(output);
     mem_free(lh);
     mem_free(hl);
     mem_free(hh);
-    mem_free(output);
+    mem_free(temp);
 }
 
 size_t dtcwt_num_positions(const DTCWTCoeffs *coeffs) {

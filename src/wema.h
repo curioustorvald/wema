@@ -130,6 +130,8 @@ typedef struct {
     float  *gray_in;        /* Grayscale input */
     float  *gray_out;       /* Grayscale output */
     float  *delta_phi;      /* Filtered phase delta */
+    float  *delta_buf;      /* Delta for spatial smoothing */
+    float  *smooth_buf;     /* Smoothed delta output */
 } WemaContext;
 
 /*============================================================================
@@ -194,6 +196,7 @@ bool wema_ready(const WemaContext *ctx);
 int  frame_alloc(Frame *frame, int width, int height, int channels);
 void frame_free(Frame *frame);
 void frame_rgb_to_gray(const Frame *rgb, float *gray);
-void frame_gray_to_rgb(const float *gray, const Frame *orig, Frame *out);
+void frame_gray_to_rgb(const float *gray, const Frame *orig, Frame *out,
+                       float *delta_buf, float *smooth_buf);
 
 #endif /* WEMA_H */

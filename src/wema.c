@@ -52,21 +52,55 @@ void frame_rgb_to_gray(const Frame *rgb, float *gray) {
     }
 }
 
-void frame_gray_to_rgb(const float *gray, const Frame *orig, Frame *out) {
-    int n = orig->width * orig->height;
+void frame_gray_to_rgb(const float *gray, const Frame *orig, Frame *out,
+                       float *delta_buf, float *smooth_buf) {
+    int w = orig->width;
+    int h = orig->height;
+    int n = w * h;
     const float *src = orig->data;
     float *dst = out->data;
 
+    /* Step 1: Compute raw delta (gray - original luminance) */
     for (int i = 0; i < n; i++) {
-        /* Original luminance */
         float orig_y = 0.299f * src[i * 3 + 0] +
                        0.587f * src[i * 3 + 1] +
                        0.114f * src[i * 3 + 2];
+        delta_buf[i] = gray[i] - orig_y;
+    }
 
-        /* Luminance difference from amplification */
-        float dy = gray[i] - orig_y;
+    /* Step 2: Spatial Gaussian blur on delta (5x5 kernel) */
+    static const float gauss5[5][5] = {
+        {1, 4, 6, 4, 1},
+        {4, 16, 24, 16, 4},
+        {6, 24, 36, 24, 6},
+        {4, 16, 24, 16, 4},
+        {1, 4, 6, 4, 1}
+    };
 
-        /* Add difference to each channel */
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            float sum = 0.0f;
+            float weight = 0.0f;
+
+            for (int ky = -2; ky <= 2; ky++) {
+                for (int kx = -2; kx <= 2; kx++) {
+                    int nx = x + kx;
+                    int ny = y + ky;
+                    if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                        float k = gauss5[ky + 2][kx + 2];
+                        sum += k * delta_buf[ny * w + nx];
+                        weight += k;
+                    }
+                }
+            }
+            smooth_buf[y * w + x] = sum / weight;
+        }
+    }
+
+    /* Step 3: Add smoothed delta to original RGB */
+    for (int i = 0; i < n; i++) {
+        float dy = smooth_buf[i];
+
         dst[i * 3 + 0] = src[i * 3 + 0] + dy;
         dst[i * 3 + 1] = src[i * 3 + 1] + dy;
         dst[i * 3 + 2] = src[i * 3 + 2] + dy;
@@ -137,8 +171,11 @@ int wema_init(WemaContext *ctx, int width, int height, float fps,
     ctx->gray_in = mem_alloc(pixels * sizeof(float));
     ctx->gray_out = mem_alloc(pixels * sizeof(float));
     ctx->delta_phi = mem_alloc(ctx->temporal_buf->num_positions * sizeof(float));
+    ctx->delta_buf = mem_alloc(pixels * sizeof(float));
+    ctx->smooth_buf = mem_alloc(pixels * sizeof(float));
 
-    if (!ctx->gray_in || !ctx->gray_out || !ctx->delta_phi) {
+    if (!ctx->gray_in || !ctx->gray_out || !ctx->delta_phi ||
+        !ctx->delta_buf || !ctx->smooth_buf) {
         goto error;
     }
 
@@ -168,9 +205,13 @@ void wema_free(WemaContext *ctx) {
     mem_free(ctx->gray_in);
     mem_free(ctx->gray_out);
     mem_free(ctx->delta_phi);
+    mem_free(ctx->delta_buf);
+    mem_free(ctx->smooth_buf);
     ctx->gray_in = NULL;
     ctx->gray_out = NULL;
     ctx->delta_phi = NULL;
+    ctx->delta_buf = NULL;
+    ctx->smooth_buf = NULL;
 }
 
 bool wema_ready(const WemaContext *ctx) {
@@ -205,8 +246,8 @@ int wema_process_frame(WemaContext *ctx, const Frame *in, Frame *out) {
     /* Step 6: DT-CWT inverse transform */
     dtcwt_inverse(ctx->coeffs, ctx->gray_out);
 
-    /* Step 7: Grayscale to RGB (blend luminance difference with original) */
-    frame_gray_to_rgb(ctx->gray_out, in, out);
+    /* Step 7: Grayscale to RGB with spatial smoothing of delta */
+    frame_gray_to_rgb(ctx->gray_out, in, out, ctx->delta_buf, ctx->smooth_buf);
 
     return 0;
 }
