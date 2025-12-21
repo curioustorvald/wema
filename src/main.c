@@ -56,7 +56,7 @@ static char *generate_output_path(const char *input) {
 static int parse_args(int argc, char **argv, WemaConfig *config) {
     /* Set defaults */
     memset(config, 0, sizeof(*config));
-    config->amp_factor = 64.0f;
+    config->amp_factor = 10.0f;
     config->f_low = 0.5f;
     config->f_high = 3.0f;
     config->verbose = false;

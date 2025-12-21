@@ -105,15 +105,11 @@ int wema_init(WemaContext *ctx, int width, int height, float fps,
     /* Compute number of DT-CWT levels */
     ctx->num_levels = dtcwt_compute_levels(width, height);
 
-    /* Allocate DT-CWT coefficients (two sets: one for modified, one for original) */
+    /* Allocate DT-CWT coefficients */
     ctx->coeffs = mem_alloc(sizeof(DTCWTCoeffs));
-    ctx->coeffs_orig = mem_alloc(sizeof(DTCWTCoeffs));
-    if (!ctx->coeffs || !ctx->coeffs_orig) goto error;
+    if (!ctx->coeffs) goto error;
 
     if (dtcwt_init(ctx->coeffs, width, height, ctx->num_levels) < 0) {
-        goto error;
-    }
-    if (dtcwt_init(ctx->coeffs_orig, width, height, ctx->num_levels) < 0) {
         goto error;
     }
 
@@ -140,10 +136,9 @@ int wema_init(WemaContext *ctx, int width, int height, float fps,
     size_t pixels = (size_t)width * height;
     ctx->gray_in = mem_alloc(pixels * sizeof(float));
     ctx->gray_out = mem_alloc(pixels * sizeof(float));
-    ctx->gray_orig_recon = mem_alloc(pixels * sizeof(float));
     ctx->delta_phi = mem_alloc(ctx->temporal_buf->num_positions * sizeof(float));
 
-    if (!ctx->gray_in || !ctx->gray_out || !ctx->gray_orig_recon || !ctx->delta_phi) {
+    if (!ctx->gray_in || !ctx->gray_out || !ctx->delta_phi) {
         goto error;
     }
 
@@ -160,11 +155,6 @@ void wema_free(WemaContext *ctx) {
         mem_free(ctx->coeffs);
         ctx->coeffs = NULL;
     }
-    if (ctx->coeffs_orig) {
-        dtcwt_free(ctx->coeffs_orig);
-        mem_free(ctx->coeffs_orig);
-        ctx->coeffs_orig = NULL;
-    }
     if (ctx->temporal_buf) {
         temporal_buffer_free(ctx->temporal_buf);
         mem_free(ctx->temporal_buf);
@@ -177,39 +167,14 @@ void wema_free(WemaContext *ctx) {
     }
     mem_free(ctx->gray_in);
     mem_free(ctx->gray_out);
-    mem_free(ctx->gray_orig_recon);
     mem_free(ctx->delta_phi);
     ctx->gray_in = NULL;
     ctx->gray_out = NULL;
-    ctx->gray_orig_recon = NULL;
     ctx->delta_phi = NULL;
 }
 
 bool wema_ready(const WemaContext *ctx) {
     return temporal_buffer_ready(ctx->temporal_buf);
-}
-
-/* Helper to copy coefficients */
-static void copy_coeffs(const DTCWTCoeffs *src, DTCWTCoeffs *dst) {
-    dst->orig_width = src->orig_width;
-    dst->orig_height = src->orig_height;
-    dst->num_levels = src->num_levels;
-    dst->lowpass_w = src->lowpass_w;
-    dst->lowpass_h = src->lowpass_h;
-
-    memcpy(dst->lowpass, src->lowpass,
-           (size_t)src->lowpass_w * src->lowpass_h * sizeof(float));
-
-    for (int lev = 0; lev < src->num_levels; lev++) {
-        for (int o = 0; o < WEMA_NUM_ORIENTATIONS; o++) {
-            int w = src->subbands[lev][o].width;
-            int h = src->subbands[lev][o].height;
-            dst->subbands[lev][o].width = w;
-            dst->subbands[lev][o].height = h;
-            memcpy(dst->subbands[lev][o].coeffs, src->subbands[lev][o].coeffs,
-                   (size_t)w * h * sizeof(Complex));
-        }
-    }
 }
 
 int wema_process_frame(WemaContext *ctx, const Frame *in, Frame *out) {
@@ -233,77 +198,15 @@ int wema_process_frame(WemaContext *ctx, const Frame *in, Frame *out) {
     /* Step 4: Temporal band-pass filtering */
     temporal_filter_apply(ctx->temporal_filt, ctx->temporal_buf, ctx->delta_phi);
 
-    /* Step 5: Copy coefficients before modification */
-    copy_coeffs(ctx->coeffs, ctx->coeffs_orig);
-
-    /* Step 6: Reconstruct original (unmodified) coefficients */
-    dtcwt_inverse(ctx->coeffs_orig, ctx->gray_orig_recon);
-
-    /* Step 7: Phase amplification on the working copy */
+    /* Step 5: Phase amplification */
     phase_amplify(ctx->delta_phi, ctx->temporal_buf->amplitude,
                   ctx->amp_factor, ctx->coeffs);
 
-    /* Step 8: DT-CWT inverse transform of amplified coefficients */
+    /* Step 6: DT-CWT inverse transform */
     dtcwt_inverse(ctx->coeffs, ctx->gray_out);
 
-    /* Step 9: Compute delta */
-    int n = ctx->width * ctx->height;
-    int w = ctx->width;
-    int h = ctx->height;
-
-    /* Compute raw delta into gray_in (reuse buffer) */
-    float *delta_buf = ctx->gray_in;
-    for (int i = 0; i < n; i++) {
-        delta_buf[i] = ctx->gray_out[i] - ctx->gray_orig_recon[i];
-    }
-
-    /* Step 10: Spatial smoothing of delta (5x5 Gaussian blur)
-     * This reduces high-frequency spatial noise in the amplified signal */
-    float *smoothed = ctx->gray_out;  /* Reuse buffer */
-    static const float gauss5[5][5] = {
-        {1, 4, 6, 4, 1},
-        {4, 16, 24, 16, 4},
-        {6, 24, 36, 24, 6},
-        {4, 16, 24, 16, 4},
-        {1, 4, 6, 4, 1}
-    };
-
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            float sum = 0.0f;
-            float weight = 0.0f;
-
-            for (int ky = -2; ky <= 2; ky++) {
-                for (int kx = -2; kx <= 2; kx++) {
-                    int nx = x + kx;
-                    int ny = y + ky;
-                    if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-                        float k = gauss5[ky + 2][kx + 2];
-                        sum += k * delta_buf[ny * w + nx];
-                        weight += k;
-                    }
-                }
-            }
-            smoothed[y * w + x] = sum / weight;
-        }
-    }
-
-    /* Step 11: Add smoothed delta to original */
-    const float *src = in->data;
-    float *dst = out->data;
-
-    for (int i = 0; i < n; i++) {
-        float delta = smoothed[i];
-
-        dst[i * 3 + 0] = src[i * 3 + 0] + delta;
-        dst[i * 3 + 1] = src[i * 3 + 1] + delta;
-        dst[i * 3 + 2] = src[i * 3 + 2] + delta;
-
-        for (int c = 0; c < 3; c++) {
-            if (dst[i * 3 + c] < 0.0f) dst[i * 3 + c] = 0.0f;
-            if (dst[i * 3 + c] > 1.0f) dst[i * 3 + c] = 1.0f;
-        }
-    }
+    /* Step 7: Grayscale to RGB (blend luminance difference with original) */
+    frame_gray_to_rgb(ctx->gray_out, in, out);
 
     return 0;
 }
