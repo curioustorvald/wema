@@ -8,15 +8,15 @@
 #include "wema.h"
 
 /*
- * Apply coefficient amplification to DT-CWT coefficients.
+ * Apply phase amplification to DT-CWT coefficients.
  *
- * delta_coeff: band-pass filtered coefficient variation [num_positions]
- * orig_coeff: original coefficient values [num_positions]
+ * delta_phi: band-pass filtered phase variation [num_positions]
+ * amplitude: coefficient amplitudes [num_positions]
  * alpha: amplification factor
  * coeffs: DT-CWT coefficients to modify in-place
  */
-void phase_amplify(const float *delta_coeff,
-                   const float *orig_coeff,
+void phase_amplify(const float *delta_phi,
+                   const float *amplitude,
                    float alpha,
                    DTCWTCoeffs *coeffs);
 

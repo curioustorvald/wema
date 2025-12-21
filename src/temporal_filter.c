@@ -158,16 +158,15 @@ void temporal_buffer_push(TemporalBuffer *buf,
 
             for (int i = 0; i < n; i++) {
                 Complex c = sub->coeffs[i];
+                float phase = cmplx_phase(c);
+                float amp = cmplx_abs(c);
 
-                /* Store the real coefficient value directly (not phase).
-                 * For Haar wavelets, phase-based amplification doesn't work
-                 * because we don't have true complex wavelets. Instead we
-                 * band-pass filter and amplify the coefficient values. */
+                /* Store phase in circular buffer */
                 size_t buf_idx = pos * buf->window_size + buf->head;
-                buf->phase_buffer[buf_idx] = c.re;
+                buf->phase_buffer[buf_idx] = phase;
 
-                /* Store current value as "amplitude" for reconstruction */
-                buf->amplitude[pos] = c.re;
+                /* Store amplitude (most recent) */
+                buf->amplitude[pos] = amp;
 
                 pos++;
             }
@@ -202,13 +201,17 @@ void temporal_filter_apply(const TemporalFilter *filt,
 
     /*
      * Compute frequency range for each wavelet scale.
-     * Scale j corresponds to frequencies around fs / 2^(j+1)
-     * where fs = 1.0 (normalized sample rate).
+     * After Haar DWT, coefficients are ordered by scale:
+     *   - Position 1: 1 coeff (coarsest detail, lowest freq)
+     *   - Positions 2-3: 2 coeffs
+     *   - Positions 4-7: 4 coeffs
+     *   - ...
+     *   - Positions n/2 to n-1: n/2 coeffs (finest detail, highest freq)
      *
-     * level 0: 0.25 - 0.5  (highest freq)
-     * level 1: 0.125 - 0.25
-     * level 2: 0.0625 - 0.125
-     * etc.
+     * For scale index s (0 = coarsest, num_levels-1 = finest):
+     *   - Number of coeffs: 2^s
+     *   - Start position: 2^s
+     *   - Frequency band: fs/2^(num_levels-s+1) to fs/2^(num_levels-s)
      */
     int num_levels = filt->temporal_levels;
     bool *keep_level = mem_alloc(num_levels * sizeof(bool));
@@ -218,26 +221,37 @@ void temporal_filter_apply(const TemporalFilter *filt,
         return;
     }
 
-    for (int j = 0; j < num_levels; j++) {
-        float f_high_scale = 0.5f / (float)(1 << j);
-        float f_low_scale = 0.5f / (float)(1 << (j + 1));
+    for (int s = 0; s < num_levels; s++) {
+        /* Scale s has 2^s coefficients starting at position 2^s
+         * Scale 0 (coarsest): covers lowest detail frequencies
+         * Scale num_levels-1 (finest): covers 0.25 - 0.5 (highest) */
+        int freq_level = num_levels - 1 - s;  /* Map to frequency index */
+        float f_high_scale = 0.5f / (float)(1 << freq_level);
+        float f_low_scale = 0.5f / (float)(1 << (freq_level + 1));
 
         /* Keep this level if it overlaps with desired band */
-        keep_level[j] = (f_high_scale >= filt->f_low_norm &&
+        keep_level[s] = (f_high_scale >= filt->f_low_norm &&
                          f_low_scale <= filt->f_high_norm);
     }
 
     for (size_t pos = 0; pos < buf->num_positions; pos++) {
-        /* Extract coefficient history from circular buffer */
+        /* Extract phase history from circular buffer */
         size_t base = pos * ws;
         int start = (buf->head + ws) % ws;  /* Oldest sample */
 
-        for (int t = 0; t < ws; t++) {
+        /* Unwrap phase as we extract (phases can wrap around ±π) */
+        float prev_phase = buf->phase_buffer[base + start];
+        temp[0] = prev_phase;
+
+        for (int t = 1; t < ws; t++) {
             int idx = (start + t) % ws;
-            temp[t] = buf->phase_buffer[base + idx];
+            float curr_phase = buf->phase_buffer[base + idx];
+            float delta = phase_diff(prev_phase, curr_phase);
+            temp[t] = temp[t - 1] + delta;
+            prev_phase = curr_phase;
         }
 
-        /* Remove DC (mean value) - we only want the temporal variations */
+        /* Remove DC (mean phase) - we only want temporal variations */
         float mean = 0.0f;
         for (int t = 0; t < ws; t++) {
             mean += temp[t];
@@ -255,16 +269,17 @@ void temporal_filter_apply(const TemporalFilter *filt,
         /* temp[0] is the DC coefficient (lowest freq) */
         temp[0] = 0.0f;  /* Always remove DC */
 
-        /* Detail coefficients at each level */
-        int level_start = 1;
-        for (int j = num_levels - 1; j >= 0; j--) {
-            int level_size = 1 << j;  /* Number of coefficients at this level */
-            if (!keep_level[j]) {
+        /* Detail coefficients at each scale:
+         * Scale s has 2^s coefficients starting at position 2^s */
+        for (int s = 0; s < num_levels; s++) {
+            int level_start = 1 << s;      /* Position 2^s */
+            int level_size = 1 << s;       /* 2^s coefficients */
+
+            if (!keep_level[s]) {
                 for (int k = 0; k < level_size; k++) {
                     temp[level_start + k] = 0.0f;
                 }
             }
-            level_start += level_size;
         }
 
         /* Inverse DWT */

@@ -129,7 +129,11 @@ typedef struct {
     /* Work buffers */
     float  *gray_in;        /* Grayscale input */
     float  *gray_out;       /* Grayscale output */
+    float  *gray_orig_recon; /* Original (non-amplified) reconstruction */
     float  *delta_phi;      /* Filtered phase delta */
+
+    /* Second set of coefficients for storing original before modification */
+    DTCWTCoeffs *coeffs_orig;
 } WemaContext;
 
 /*============================================================================
