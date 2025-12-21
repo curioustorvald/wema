@@ -26,6 +26,8 @@ static void print_usage(const char *prog) {
         "  --fh <freq>            High frequency cutoff in Hz (default: 3.0)\n"
         "  --ff-codec <codec>     FFmpeg video codec (default: ffv1)\n"
         "  --ff-option <opts>     FFmpeg encoder options\n"
+        "  --no-edge-aware        Disable edge-aware guided filter\n"
+        "  --no-spatial-smooth    Disable spatial smoothing of wavelet deltas\n"
         "  -v, --verbose          Verbose output\n"
         "  -h, --help             Show this help\n"
         "\n"
@@ -60,6 +62,8 @@ static int parse_args(int argc, char **argv, WemaConfig *config) {
     config->f_low = 0.5f;
     config->f_high = 3.0f;
     config->verbose = false;
+    config->edge_aware = true;     /* Enabled by default */
+    config->spatial_smooth = true; /* Enabled by default */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--input") == 0) {
@@ -126,6 +130,12 @@ static int parse_args(int argc, char **argv, WemaConfig *config) {
         else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             config->verbose = true;
         }
+        else if (strcmp(argv[i], "--no-edge-aware") == 0) {
+            config->edge_aware = false;
+        }
+        else if (strcmp(argv[i], "--no-spatial-smooth") == 0) {
+            config->spatial_smooth = false;
+        }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             exit(0);
@@ -187,6 +197,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Settings:\n");
         fprintf(stderr, "  Amplification: %.1f\n", config.amp_factor);
         fprintf(stderr, "  Frequency band: %.2f - %.2f Hz\n", config.f_low, config.f_high);
+        fprintf(stderr, "  Edge-aware filter: %s\n", config.edge_aware ? "enabled" : "disabled");
+        fprintf(stderr, "  Spatial smoothing: %s\n", config.spatial_smooth ? "enabled" : "disabled");
     }
 
     /* Initialize WEMA context */
@@ -198,6 +210,8 @@ int main(int argc, char **argv) {
         mem_free(auto_output);
         return 1;
     }
+    ctx.edge_aware = config.edge_aware;
+    ctx.spatial_smooth = config.spatial_smooth;
 
     /* Open output */
     FFmpegIO io_out = {0};

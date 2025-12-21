@@ -116,6 +116,8 @@ typedef struct {
     float  f_low;           /* Low frequency cutoff (Hz) */
     float  f_high;          /* High frequency cutoff (Hz) */
     int    num_levels;      /* DT-CWT decomposition levels */
+    bool   edge_aware;      /* Use edge-aware guided filter */
+    bool   spatial_smooth;  /* Smooth wavelet deltas spatially */
 
     /* Normalized frequencies */
     float  f_low_norm;
@@ -132,6 +134,8 @@ typedef struct {
     float  *delta_phi;      /* Filtered phase delta */
     float  *delta_buf;      /* Delta for spatial smoothing */
     float  *smooth_buf;     /* Smoothed delta output */
+    float  *guide_buf;      /* Guide image for edge-aware filter */
+    float  *guided_work[4]; /* Work buffers for guided filter */
 } WemaContext;
 
 /*============================================================================
@@ -176,6 +180,8 @@ typedef struct {
     char   *ff_options;     /* Default: NULL */
 
     bool    verbose;
+    bool    edge_aware;     /* Default: true (use guided filter) */
+    bool    spatial_smooth; /* Default: true (smooth wavelet deltas) */
 } WemaConfig;
 
 /*============================================================================
