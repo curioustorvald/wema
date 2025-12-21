@@ -14,19 +14,10 @@
  * Configuration Constants
  *===========================================================================*/
 
-#define WEMA_MAX_LEVELS          4    /* Maximum DT-CWT decomposition levels */
-#define WEMA_NUM_ORIENTATIONS    6    /* 2D DT-CWT orientations per level */
+#define WEMA_MAX_LEVELS          4    /* Maximum 2D DWT decomposition levels */
+#define WEMA_NUM_ORIENTATIONS    6    /* Subband slots per level (3 unique + 3 mirrored) */
 #define WEMA_TEMPORAL_WINDOW_DEF 32   /* Default sliding window size */
 #define WEMA_TEMPORAL_WINDOW_MAX 256  /* Maximum sliding window size */
-
-/*============================================================================
- * Complex Number Type
- *===========================================================================*/
-
-typedef struct {
-    float re;
-    float im;
-} Complex;
 
 /*============================================================================
  * Video Frame
@@ -40,21 +31,21 @@ typedef struct {
 } Frame;
 
 /*============================================================================
- * DT-CWT Subband (single orientation at single level)
+ * DWT Subband (single orientation at single level)
  *===========================================================================*/
 
 typedef struct {
-    Complex *coeffs;  /* Complex coefficients [height * width] */
+    float   *coeffs;  /* Wavelet coefficients [height * width] */
     int      width;   /* Subband width (halved at each level) */
     int      height;  /* Subband height (halved at each level) */
 } Subband;
 
 /*============================================================================
- * DT-CWT Decomposition (single frame)
+ * 2D DWT Decomposition (single frame)
  *===========================================================================*/
 
 typedef struct {
-    /* Lowpass residual (real-valued) */
+    /* Lowpass residual */
     float *lowpass;
     int    lowpass_w;
     int    lowpass_h;
@@ -65,7 +56,7 @@ typedef struct {
     int num_levels;
     int orig_width;
     int orig_height;
-} DTCWTCoeffs;
+} DWTCoeffs;
 
 /*============================================================================
  * Temporal Sliding Window Buffer
@@ -126,7 +117,7 @@ typedef struct {
     float  f_high_norm;
 
     /* Internal state */
-    DTCWTCoeffs    *coeffs;
+    DWTCoeffs      *coeffs;
     TemporalBuffer *temporal_buf;
     TemporalFilter *temporal_filt;
 

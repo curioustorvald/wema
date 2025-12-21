@@ -25,10 +25,10 @@ int temporal_filter_init(TemporalFilter *filt,
 void temporal_filter_free(TemporalFilter *filt);
 
 /*
- * Initialize temporal buffer for phase storage.
+ * Initialize temporal buffer for coefficient storage.
  */
 int temporal_buffer_init(TemporalBuffer *buf,
-                         const DTCWTCoeffs *coeffs,
+                         const DWTCoeffs *coeffs,
                          int window_size);
 
 /*
@@ -37,10 +37,10 @@ int temporal_buffer_init(TemporalBuffer *buf,
 void temporal_buffer_free(TemporalBuffer *buf);
 
 /*
- * Push new frame's phase values into temporal buffer.
+ * Push new frame's coefficient values into temporal buffer.
  */
 void temporal_buffer_push(TemporalBuffer *buf,
-                          const DTCWTCoeffs *coeffs);
+                          const DWTCoeffs *coeffs);
 
 /*
  * Apply temporal band-pass filter.

@@ -3,18 +3,17 @@
  *
  * Orchestrates the motion amplification process:
  * 1. RGB to grayscale
- * 2. DT-CWT decomposition
- * 3. Temporal phase filtering
- * 4. Phase amplification
- * 5. DT-CWT reconstruction
+ * 2. 2D DWT decomposition
+ * 3. Temporal coefficient filtering
+ * 4. Coefficient amplification
+ * 5. 2D DWT reconstruction
  * 6. Grayscale to RGB (blend with original)
  */
 
 #include "wema.h"
-#include "dtcwt.h"
+#include "dwt.h"
 #include "temporal_filter.h"
 #include "phase_amp.h"
-#include "complex_math.h"
 #include "alloc.h"
 
 #include <stdlib.h>
@@ -318,14 +317,14 @@ int wema_init(WemaContext *ctx, int width, int height, float fps,
     if (ctx->f_low_norm < 0.0f) ctx->f_low_norm = 0.0f;
     if (ctx->f_high_norm > 1.0f) ctx->f_high_norm = 1.0f;
 
-    /* Compute number of DT-CWT levels */
-    ctx->num_levels = dtcwt_compute_levels(width, height);
+    /* Compute number of DWT levels */
+    ctx->num_levels = dwt_compute_levels(width, height);
 
-    /* Allocate DT-CWT coefficients */
-    ctx->coeffs = mem_alloc(sizeof(DTCWTCoeffs));
+    /* Allocate DWT coefficients */
+    ctx->coeffs = mem_alloc(sizeof(DWTCoeffs));
     if (!ctx->coeffs) goto error;
 
-    if (dtcwt_init(ctx->coeffs, width, height, ctx->num_levels) < 0) {
+    if (dwt_init(ctx->coeffs, width, height, ctx->num_levels) < 0) {
         goto error;
     }
 
@@ -379,7 +378,7 @@ error:
 
 void wema_free(WemaContext *ctx) {
     if (ctx->coeffs) {
-        dtcwt_free(ctx->coeffs);
+        dwt_free(ctx->coeffs);
         mem_free(ctx->coeffs);
         ctx->coeffs = NULL;
     }
@@ -419,10 +418,10 @@ int wema_process_frame(WemaContext *ctx, const Frame *in, Frame *out) {
     /* Step 1: RGB to grayscale */
     frame_rgb_to_gray(in, ctx->gray_in);
 
-    /* Step 2: DT-CWT forward transform */
-    dtcwt_forward(ctx->gray_in, ctx->width, ctx->height, ctx->coeffs);
+    /* Step 2: 2D DWT forward transform */
+    dwt_forward(ctx->gray_in, ctx->width, ctx->height, ctx->coeffs);
 
-    /* Step 3: Push phases to temporal buffer */
+    /* Step 3: Push coefficients to temporal buffer */
     temporal_buffer_push(ctx->temporal_buf, ctx->coeffs);
 
     /* Check if we have enough frames for filtering */
@@ -437,12 +436,12 @@ int wema_process_frame(WemaContext *ctx, const Frame *in, Frame *out) {
     temporal_filter_apply(ctx->temporal_filt, ctx->temporal_buf, ctx->delta_phi,
                           ctx->bilateral_temp);
 
-    /* Step 5: Phase amplification */
-    phase_amplify(ctx->delta_phi, ctx->temporal_buf->amplitude,
+    /* Step 5: Coefficient amplification */
+    coeff_amplify(ctx->delta_phi, ctx->temporal_buf->amplitude,
                   ctx->amp_factor, ctx->coeffs);
 
-    /* Step 6: DT-CWT inverse transform */
-    dtcwt_inverse(ctx->coeffs, ctx->gray_out);
+    /* Step 6: 2D DWT inverse transform */
+    dwt_inverse(ctx->coeffs, ctx->gray_out);
 
     /* Step 7: Grayscale to RGB with edge-aware smoothing */
     frame_gray_to_rgb_ex(ctx->gray_out, in, out,

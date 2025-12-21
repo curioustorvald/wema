@@ -6,7 +6,6 @@
  */
 
 #include "temporal_filter.h"
-#include "complex_math.h"
 #include "alloc.h"
 
 #include <stdlib.h>
@@ -106,7 +105,7 @@ void temporal_filter_free(TemporalFilter *filt) {
 }
 
 int temporal_buffer_init(TemporalBuffer *buf,
-                         const DTCWTCoeffs *coeffs,
+                         const DWTCoeffs *coeffs,
                          int window_size) {
     memset(buf, 0, sizeof(*buf));
 
@@ -148,7 +147,7 @@ void temporal_buffer_free(TemporalBuffer *buf) {
 }
 
 void temporal_buffer_push(TemporalBuffer *buf,
-                          const DTCWTCoeffs *coeffs) {
+                          const DWTCoeffs *coeffs) {
     size_t pos = 0;
 
     for (int lev = 0; lev < coeffs->num_levels; lev++) {
@@ -157,17 +156,14 @@ void temporal_buffer_push(TemporalBuffer *buf,
             int n = sub->width * sub->height;
 
             for (int i = 0; i < n; i++) {
-                Complex c = sub->coeffs[i];
+                float c = sub->coeffs[i];
 
-                /* Store the real coefficient value directly (not phase).
-                 * For Haar wavelets, phase-based amplification doesn't work
-                 * because we don't have true complex wavelets. Instead we
-                 * band-pass filter and amplify the coefficient values. */
+                /* Store coefficient value for temporal filtering */
                 size_t buf_idx = pos * buf->window_size + buf->head;
-                buf->phase_buffer[buf_idx] = c.re;
+                buf->phase_buffer[buf_idx] = c;
 
-                /* Store current value as "amplitude" for reconstruction */
-                buf->amplitude[pos] = c.re;
+                /* Store current value for reconstruction */
+                buf->amplitude[pos] = c;
 
                 pos++;
             }

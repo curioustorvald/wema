@@ -1,12 +1,11 @@
 /*
- * WEMA - Spatial Wavelet Transform
+ * WEMA - 2D Discrete Wavelet Transform
  *
  * Implementation using CDF 9/7 biorthogonal wavelets via lifting scheme.
  * Uses standard dyadic decomposition with uniform subband sizes.
  */
 
-#include "dtcwt.h"
-#include "complex_math.h"
+#include "dwt.h"
 #include "alloc.h"
 
 #include <stdlib.h>
@@ -215,7 +214,7 @@ static void cdf97_2d_inverse(const float *ll, const float *lh,
  * Public API
  *===========================================================================*/
 
-int dtcwt_compute_levels(int width, int height) {
+int dwt_compute_levels(int width, int height) {
     int min_dim = (width < height) ? width : height;
     int levels = 0;
     while (min_dim >= 16 && levels < WEMA_MAX_LEVELS) {
@@ -225,7 +224,7 @@ int dtcwt_compute_levels(int width, int height) {
     return levels > 0 ? levels : 1;
 }
 
-int dtcwt_init(DTCWTCoeffs *coeffs, int width, int height, int num_levels) {
+int dwt_init(DWTCoeffs *coeffs, int width, int height, int num_levels) {
     memset(coeffs, 0, sizeof(*coeffs));
 
     coeffs->orig_width = width;
@@ -242,9 +241,9 @@ int dtcwt_init(DTCWTCoeffs *coeffs, int width, int height, int num_levels) {
         for (int o = 0; o < WEMA_NUM_ORIENTATIONS; o++) {
             coeffs->subbands[lev][o].width = w;
             coeffs->subbands[lev][o].height = h;
-            coeffs->subbands[lev][o].coeffs = mem_calloc(w * h, sizeof(Complex));
+            coeffs->subbands[lev][o].coeffs = mem_calloc(w * h, sizeof(float));
             if (!coeffs->subbands[lev][o].coeffs) {
-                dtcwt_free(coeffs);
+                dwt_free(coeffs);
                 return -1;
             }
         }
@@ -254,14 +253,14 @@ int dtcwt_init(DTCWTCoeffs *coeffs, int width, int height, int num_levels) {
     coeffs->lowpass_h = h;
     coeffs->lowpass = mem_calloc(w * h, sizeof(float));
     if (!coeffs->lowpass) {
-        dtcwt_free(coeffs);
+        dwt_free(coeffs);
         return -1;
     }
 
     return 0;
 }
 
-void dtcwt_free(DTCWTCoeffs *coeffs) {
+void dwt_free(DWTCoeffs *coeffs) {
     for (int lev = 0; lev < WEMA_MAX_LEVELS; lev++) {
         for (int o = 0; o < WEMA_NUM_ORIENTATIONS; o++) {
             mem_free(coeffs->subbands[lev][o].coeffs);
@@ -272,8 +271,8 @@ void dtcwt_free(DTCWTCoeffs *coeffs) {
     coeffs->lowpass = NULL;
 }
 
-void dtcwt_forward(const float *image, int width, int height,
-                   DTCWTCoeffs *coeffs) {
+void dwt_forward(const float *image, int width, int height,
+                 DWTCoeffs *coeffs) {
     size_t max_size = (size_t)width * height;
     float *work = mem_alloc(max_size * sizeof(float));
     float *ll = mem_alloc(max_size * sizeof(float));
@@ -304,16 +303,16 @@ void dtcwt_forward(const float *image, int width, int height,
 
         cdf97_2d_forward(work, cur_w, cur_h, ll, lh, hl, hh, sub_w, sub_h, temp);
 
-        /* Store in complex subbands */
+        /* Store subbands (with mirroring for 6 slots) */
         int n = sub_w * sub_h;
         for (int i = 0; i < n; i++) {
-            coeffs->subbands[lev][0].coeffs[i] = cmplx(lh[i], 0.001f * lh[i]);
-            coeffs->subbands[lev][1].coeffs[i] = cmplx(hh[i], 0.001f * hh[i]);
-            coeffs->subbands[lev][2].coeffs[i] = cmplx(hl[i], 0.001f * hl[i]);
-            /* Mirror for 6 orientations */
-            coeffs->subbands[lev][3].coeffs[i] = coeffs->subbands[lev][2].coeffs[i];
-            coeffs->subbands[lev][4].coeffs[i] = coeffs->subbands[lev][1].coeffs[i];
-            coeffs->subbands[lev][5].coeffs[i] = coeffs->subbands[lev][0].coeffs[i];
+            coeffs->subbands[lev][0].coeffs[i] = lh[i];
+            coeffs->subbands[lev][1].coeffs[i] = hh[i];
+            coeffs->subbands[lev][2].coeffs[i] = hl[i];
+            /* Mirror for 6 orientations (compatibility) */
+            coeffs->subbands[lev][3].coeffs[i] = hl[i];
+            coeffs->subbands[lev][4].coeffs[i] = hh[i];
+            coeffs->subbands[lev][5].coeffs[i] = lh[i];
         }
 
         /* Next level operates on LL */
@@ -332,7 +331,7 @@ void dtcwt_forward(const float *image, int width, int height,
     mem_free(temp);
 }
 
-void dtcwt_inverse(const DTCWTCoeffs *coeffs, float *image) {
+void dwt_inverse(const DWTCoeffs *coeffs, float *image) {
     /* Precompute level dimensions */
     int level_w[WEMA_MAX_LEVELS + 1];
     int level_h[WEMA_MAX_LEVELS + 1];
@@ -373,12 +372,12 @@ void dtcwt_inverse(const DTCWTCoeffs *coeffs, float *image) {
         int sub_w = level_w[lev + 1];
         int sub_h = level_h[lev + 1];
 
-        /* Extract real parts from complex subbands */
+        /* Extract subbands */
         int n = sub_w * sub_h;
         for (int i = 0; i < n; i++) {
-            lh[i] = coeffs->subbands[lev][0].coeffs[i].re;
-            hh[i] = coeffs->subbands[lev][1].coeffs[i].re;
-            hl[i] = coeffs->subbands[lev][2].coeffs[i].re;
+            lh[i] = coeffs->subbands[lev][0].coeffs[i];
+            hh[i] = coeffs->subbands[lev][1].coeffs[i];
+            hl[i] = coeffs->subbands[lev][2].coeffs[i];
         }
 
         cdf97_2d_inverse(work, lh, hl, hh, sub_w, sub_h, output, out_w, out_h, temp);
@@ -396,7 +395,7 @@ void dtcwt_inverse(const DTCWTCoeffs *coeffs, float *image) {
     mem_free(temp);
 }
 
-size_t dtcwt_num_positions(const DTCWTCoeffs *coeffs) {
+size_t dwt_num_positions(const DWTCoeffs *coeffs) {
     size_t total = 0;
     for (int lev = 0; lev < coeffs->num_levels; lev++) {
         for (int o = 0; o < WEMA_NUM_ORIENTATIONS; o++) {
