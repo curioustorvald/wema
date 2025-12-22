@@ -38,16 +38,14 @@ void frame_free(Frame *frame) {
     frame->data = NULL;
 }
 
-void frame_rgb_to_gray(const Frame *rgb, float *gray) {
-    int n = rgb->width * rgb->height;
-    const float *src = rgb->data;
+void frame_rgb_to_gray(const Frame *rgb, float * restrict gray) {
+    const int n = rgb->width * rgb->height;
+    const float * restrict src = rgb->data;
 
+    /* Vectorizable with stride-3 gather */
     for (int i = 0; i < n; i++) {
-        /* ITU-R BT.601 luma coefficients */
-        float r = src[i * 3 + 0];
-        float g = src[i * 3 + 1];
-        float b = src[i * 3 + 2];
-        gray[i] = 0.299f * r + 0.587f * g + 0.114f * b;
+        const int idx = i * 3;
+        gray[i] = 0.299f * src[idx] + 0.587f * src[idx + 1] + 0.114f * src[idx + 2];
     }
 }
 
@@ -61,77 +59,70 @@ void frame_rgb_to_gray(const Frame *rgb, float *gray) {
  * to minimize |output - input|^2 + epsilon * a^2
  *===========================================================================*/
 
-static void box_filter(const float *input, float *output, int w, int h, int r) {
-    /* Separable box filter with radius r */
-    float *temp = mem_alloc((size_t)w * h * sizeof(float));
-    if (!temp) {
-        memcpy(output, input, (size_t)w * h * sizeof(float));
+static void box_filter(const float * restrict input, float * restrict output,
+                       int w, int h, int r) {
+    /*
+     * Optimized box filter using prefix sums (integral image approach).
+     * O(1) per pixel after prefix computation.
+     */
+    const size_t size = (size_t)w * h;
+    int max_dim = (w > h) ? w : h;
+    float * restrict temp = mem_alloc(size * sizeof(float));
+    float * restrict prefix = mem_alloc((size_t)(max_dim + 1) * sizeof(float));
+    if (!temp || !prefix) {
+        if (temp) mem_free(temp);
+        if (prefix) mem_free(prefix);
+        memcpy(output, input, size * sizeof(float));
         return;
     }
 
-    /* Horizontal pass */
+    /* Horizontal pass using prefix sums */
     for (int y = 0; y < h; y++) {
-        float sum = 0.0f;
-        int count = 0;
+        const float * restrict row_in = input + y * w;
+        float * restrict row_out = temp + y * w;
 
-        /* Initialize window */
-        for (int x = 0; x <= r && x < w; x++) {
-            sum += input[y * w + x];
-            count++;
-        }
-
+        /* Build prefix sum for this row */
+        prefix[0] = 0.0f;
         for (int x = 0; x < w; x++) {
-            temp[y * w + x] = sum / (float)count;
+            prefix[x + 1] = prefix[x] + row_in[x];
+        }
 
-            /* Slide window */
-            int add_x = x + r + 1;
-            int rem_x = x - r;
-            if (add_x < w) {
-                sum += input[y * w + add_x];
-                count++;
-            }
-            if (rem_x >= 0) {
-                sum -= input[y * w + rem_x];
-                count--;
-            }
+        /* Compute box filter using prefix sums */
+        for (int x = 0; x < w; x++) {
+            int left = (x - r > 0) ? (x - r) : 0;
+            int right = (x + r + 1 < w) ? (x + r + 1) : w;
+            float sum = prefix[right] - prefix[left];
+            row_out[x] = sum / (float)(right - left);
         }
     }
 
-    /* Vertical pass */
+    /* Vertical pass - transpose-friendly access pattern */
+    float * restrict col_prefix = prefix;  /* Reuse buffer */
     for (int x = 0; x < w; x++) {
-        float sum = 0.0f;
-        int count = 0;
-
-        /* Initialize window */
-        for (int y = 0; y <= r && y < h; y++) {
-            sum += temp[y * w + x];
-            count++;
+        /* Build prefix sum for this column */
+        col_prefix[0] = 0.0f;
+        for (int y = 0; y < h; y++) {
+            col_prefix[y + 1] = col_prefix[y] + temp[y * w + x];
         }
 
+        /* Compute box filter using prefix sums */
         for (int y = 0; y < h; y++) {
-            output[y * w + x] = sum / (float)count;
-
-            /* Slide window */
-            int add_y = y + r + 1;
-            int rem_y = y - r;
-            if (add_y < h) {
-                sum += temp[add_y * w + x];
-                count++;
-            }
-            if (rem_y >= 0) {
-                sum -= temp[rem_y * w + x];
-                count--;
-            }
+            int top = (y - r > 0) ? (y - r) : 0;
+            int bottom = (y + r + 1 < h) ? (y + r + 1) : h;
+            float sum = col_prefix[bottom] - col_prefix[top];
+            output[y * w + x] = sum / (float)(bottom - top);
         }
     }
 
+    mem_free(prefix);
     mem_free(temp);
 }
 
-static void guided_filter(const float *guide, const float *input,
-                          float *output, int w, int h,
+static void guided_filter(const float * restrict guide, const float * restrict input,
+                          float * restrict output, int w, int h,
                           int radius, float epsilon,
-                          float *work1, float *work2, float *work3, float *work4) {
+                          float * restrict work1, float * restrict work2,
+                          float * restrict work3, float * restrict work4) {
     int n = w * h;
 
     /* mean_I = boxfilter(guide) */
@@ -190,34 +181,53 @@ static void guided_filter(const float *guide, const float *input,
  * Gaussian blur fallback (when edge-aware is disabled)
  *===========================================================================*/
 
-static void gaussian_blur_5x5(const float *input, float *output, int w, int h) {
-    static const float gauss5[5][5] = {
-        {1, 4, 6, 4, 1},
-        {4, 16, 24, 16, 4},
-        {6, 24, 36, 24, 6},
-        {4, 16, 24, 16, 4},
-        {1, 4, 6, 4, 1}
-    };
+static void gaussian_blur_5x5(const float * restrict input, float * restrict output,
+                              int w, int h) {
+    /* Separable Gaussian: [1, 4, 6, 4, 1] / 16 */
+    static const float kernel[5] = {1.0f/16.0f, 4.0f/16.0f, 6.0f/16.0f, 4.0f/16.0f, 1.0f/16.0f};
 
+    float * restrict temp = mem_alloc((size_t)w * h * sizeof(float));
+    if (!temp) {
+        memcpy(output, input, (size_t)w * h * sizeof(float));
+        return;
+    }
+
+    /* Horizontal pass */
+    for (int y = 0; y < h; y++) {
+        const float * restrict row_in = input + y * w;
+        float * restrict row_out = temp + y * w;
+
+        for (int x = 0; x < w; x++) {
+            float sum = 0.0f;
+            float weight = 0.0f;
+            for (int k = -2; k <= 2; k++) {
+                int nx = x + k;
+                if (nx >= 0 && nx < w) {
+                    sum += kernel[k + 2] * row_in[nx];
+                    weight += kernel[k + 2];
+                }
+            }
+            row_out[x] = sum / weight;
+        }
+    }
+
+    /* Vertical pass */
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             float sum = 0.0f;
             float weight = 0.0f;
-
-            for (int ky = -2; ky <= 2; ky++) {
-                for (int kx = -2; kx <= 2; kx++) {
-                    int nx = x + kx;
-                    int ny = y + ky;
-                    if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-                        float k = gauss5[ky + 2][kx + 2];
-                        sum += k * input[ny * w + nx];
-                        weight += k;
-                    }
+            for (int k = -2; k <= 2; k++) {
+                int ny = y + k;
+                if (ny >= 0 && ny < h) {
+                    sum += kernel[k + 2] * temp[ny * w + x];
+                    weight += kernel[k + 2];
                 }
             }
             output[y * w + x] = sum / weight;
         }
     }
+
+    mem_free(temp);
 }
 
 /*============================================================================

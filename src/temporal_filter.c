@@ -13,49 +13,39 @@
 #include <math.h>
 
 /*============================================================================
- * Haar wavelet 1D transform
+ * Haar wavelet 1D transform (optimized - no allocation)
  *===========================================================================*/
 
-/* In-place Haar DWT */
-static void haar_dwt_1d(float *data, int n) {
-    float *temp = mem_alloc(n * sizeof(float));
-    if (!temp) return;
-
+/* In-place Haar DWT using external temp buffer */
+static void haar_dwt_1d(float * restrict data, int n, float * restrict temp) {
     int len = n;
     while (len > 1) {
-        int half = len / 2;
+        const int half = len / 2;
         for (int i = 0; i < half; i++) {
-            float a = data[2 * i];
-            float b = data[2 * i + 1];
-            temp[i] = (a + b) * 0.5f;         /* Lowpass (average) */
-            temp[half + i] = (a - b) * 0.5f;  /* Highpass (difference) */
+            const float a = data[2 * i];
+            const float b = data[2 * i + 1];
+            temp[i] = (a + b) * 0.5f;
+            temp[half + i] = (a - b) * 0.5f;
         }
         memcpy(data, temp, len * sizeof(float));
         len = half;
     }
-
-    mem_free(temp);
 }
 
-/* In-place Haar inverse DWT */
-static void haar_idwt_1d(float *data, int n) {
-    float *temp = mem_alloc(n * sizeof(float));
-    if (!temp) return;
-
+/* In-place Haar inverse DWT using external temp buffer */
+static void haar_idwt_1d(float * restrict data, int n, float * restrict temp) {
     int len = 2;
     while (len <= n) {
-        int half = len / 2;
+        const int half = len / 2;
         for (int i = 0; i < half; i++) {
-            float lo = data[i];
-            float hi = data[half + i];
+            const float lo = data[i];
+            const float hi = data[half + i];
             temp[2 * i] = lo + hi;
             temp[2 * i + 1] = lo - hi;
         }
         memcpy(data, temp, len * sizeof(float));
         len *= 2;
     }
-
-    mem_free(temp);
 }
 
 /*============================================================================
@@ -179,164 +169,152 @@ void temporal_buffer_push(TemporalBuffer *buf,
 
 void temporal_filter_apply(const TemporalFilter *filt,
                            const TemporalBuffer *buf,
-                           float *delta_phi_filtered,
+                           float * restrict delta_phi_filtered,
                            bool bilateral) {
     if (buf->filled < buf->window_size) {
-        /* Not enough data yet */
         memset(delta_phi_filtered, 0, buf->num_positions * sizeof(float));
         return;
     }
 
-    int ws = buf->window_size;
-    int center = ws / 2;
+    const int ws = buf->window_size;
+    const int center = ws / 2;
+    const int num_levels = filt->temporal_levels;
+    const float inv_ws = 1.0f / (float)ws;
+    const float * restrict phase_buf = buf->phase_buffer;
 
-    /* Allocate work buffers */
-    float *temp = mem_alloc(ws * sizeof(float));
-    float *weights = bilateral ? mem_alloc(ws * sizeof(float)) : NULL;
-    if (!temp) {
-        memset(delta_phi_filtered, 0, buf->num_positions * sizeof(float));
-        return;
-    }
+    /* Pre-allocate all work buffers once */
+    float * restrict temp = mem_alloc(ws * sizeof(float));
+    float * restrict haar_work = mem_alloc(ws * sizeof(float));
+    float * restrict weights = bilateral ? mem_alloc(ws * sizeof(float)) : NULL;
+    float * restrict orig_vals = bilateral ? mem_alloc(ws * sizeof(float)) : NULL;
 
-    /*
-     * Compute frequency range for each wavelet scale.
-     * Scale j corresponds to frequencies around fs / 2^(j+1)
-     * where fs = 1.0 (normalized sample rate).
-     *
-     * level 0: 0.25 - 0.5  (highest freq)
-     * level 1: 0.125 - 0.25
-     * level 2: 0.0625 - 0.125
-     * etc.
-     */
-    int num_levels = filt->temporal_levels;
-    bool *keep_level = mem_alloc(num_levels * sizeof(bool));
-    if (!keep_level) {
+    if (!temp || !haar_work || (bilateral && (!weights || !orig_vals))) {
         mem_free(temp);
+        mem_free(haar_work);
         mem_free(weights);
+        mem_free(orig_vals);
         memset(delta_phi_filtered, 0, buf->num_positions * sizeof(float));
         return;
     }
 
-    for (int j = 0; j < num_levels; j++) {
+    /* Precompute which levels to keep */
+    bool keep_level[16];  /* Max 16 levels (2^16 = 64K window) */
+    for (int j = 0; j < num_levels && j < 16; j++) {
         float f_high_scale = 0.5f / (float)(1 << j);
         float f_low_scale = 0.5f / (float)(1 << (j + 1));
-
-        /* Keep this level if it overlaps with desired band */
         keep_level[j] = (f_high_scale >= filt->f_low_norm &&
                          f_low_scale <= filt->f_high_norm);
     }
 
-    /* For bilateral: second buffer to store bandpass-filtered results */
-    float *bandpass_buf = bilateral ? mem_alloc(ws * sizeof(float)) : NULL;
+    /* Precompute time weights for bilateral (Gaussian, position-independent) */
+    float time_weights[256];  /* Max window size */
+    if (bilateral) {
+        const float time_sigma = (float)ws * 0.15f;
+        const float inv_2sigma_sq = 1.0f / (2.0f * time_sigma * time_sigma);
+        for (int t = 0; t < ws; t++) {
+            float time_diff = (float)(t - center);
+            time_weights[t] = expf(-(time_diff * time_diff) * inv_2sigma_sq);
+        }
+    }
 
+    /* Precompute circular buffer indices */
+    const int start = (buf->head + ws) % ws;
+
+    /* Main processing loop */
     for (size_t pos = 0; pos < buf->num_positions; pos++) {
-        /* Extract coefficient history from circular buffer */
-        size_t base = pos * ws;
-        int start = (buf->head + ws) % ws;  /* Oldest sample */
+        const size_t base = pos * ws;
 
-        for (int t = 0; t < ws; t++) {
-            int idx = (start + t) % ws;
-            temp[t] = buf->phase_buffer[base + idx];
-        }
-
-        float current_val = temp[center];
-
-        /* Standard DC removal */
+        /* Extract coefficient history - unroll for common window sizes */
         float mean = 0.0f;
-        for (int t = 0; t < ws; t++) {
-            mean += temp[t];
+        if (start == 0) {
+            /* Contiguous case - vectorizable */
+            for (int t = 0; t < ws; t++) {
+                float val = phase_buf[base + t];
+                temp[t] = val;
+                mean += val;
+            }
+        } else {
+            /* Wrapped case */
+            for (int t = 0; t < ws; t++) {
+                int idx = (start + t) % ws;
+                float val = phase_buf[base + idx];
+                temp[t] = val;
+                mean += val;
+            }
         }
-        mean /= (float)ws;
 
+        const float current_val = temp[center];
+        mean *= inv_ws;
+
+        /* DC removal - vectorizable */
         for (int t = 0; t < ws; t++) {
             temp[t] -= mean;
         }
 
         /* Apply temporal DWT */
-        haar_dwt_1d(temp, ws);
+        haar_dwt_1d(temp, ws, haar_work);
 
-        /* Zero out scales outside frequency band */
-        /* temp[0] is the DC coefficient (lowest freq) */
-        temp[0] = 0.0f;  /* Always remove DC */
-
-        /* Detail coefficients at each level */
+        /* Zero out DC and unwanted scales */
+        temp[0] = 0.0f;
         int level_start = 1;
         for (int j = num_levels - 1; j >= 0; j--) {
-            int level_size = 1 << j;  /* Number of coefficients at this level */
+            int level_size = 1 << j;
             if (!keep_level[j]) {
-                for (int k = 0; k < level_size; k++) {
-                    temp[level_start + k] = 0.0f;
-                }
+                memset(temp + level_start, 0, level_size * sizeof(float));
             }
             level_start += level_size;
         }
 
         /* Inverse DWT */
-        haar_idwt_1d(temp, ws);
+        haar_idwt_1d(temp, ws, haar_work);
 
-        if (bilateral && weights && bandpass_buf) {
-            /*
-             * Bilateral temporal filtering on bandpass output:
-             * Weight each bandpass-filtered time sample by how similar
-             * the original coefficient was to the current frame.
-             * This preserves coherent motion while averaging out noise.
-             */
-
-            /* Re-extract original coefficients for similarity comparison */
-            for (int t = 0; t < ws; t++) {
-                int idx = (start + t) % ws;
-                bandpass_buf[t] = buf->phase_buffer[base + idx];
+        if (bilateral) {
+            /* Re-extract original for bilateral weighting */
+            if (start == 0) {
+                memcpy(orig_vals, phase_buf + base, ws * sizeof(float));
+            } else {
+                for (int t = 0; t < ws; t++) {
+                    orig_vals[t] = phase_buf[base + (start + t) % ws];
+                }
             }
 
-            /* Compute MAD (median absolute deviation) for robust sigma estimate */
-            float median_approx = current_val;  /* Use current as reference */
+            /* Compute MAD for adaptive sigma */
             float mad_sum = 0.0f;
             for (int t = 0; t < ws; t++) {
-                float dev = bandpass_buf[t] - median_approx;
-                mad_sum += (dev > 0) ? dev : -dev;
+                float dev = orig_vals[t] - current_val;
+                mad_sum += (dev > 0.0f) ? dev : -dev;
             }
-            float mad = mad_sum / (float)ws;
+            float sigma = fmaxf(mad_sum * inv_ws * 0.5f, 0.001f);
+            float inv_2sigma_sq = 1.0f / (2.0f * sigma * sigma);
 
-            /* Sigma: smaller = more aggressive noise rejection
-             * Use MAD-based estimate, with minimum floor */
-            float sigma = fmaxf(mad * 0.5f, 0.001f);
-            float sigma_sq = sigma * sigma;
-
-            /* Compute bilateral weights based on coefficient similarity */
+            /* Compute bilateral weights */
             float weight_sum = 0.0f;
             for (int t = 0; t < ws; t++) {
-                float diff = bandpass_buf[t] - current_val;
-                float range_weight = expf(-(diff * diff) / (2.0f * sigma_sq));
-
-                /* Temporal proximity weight - closer frames weighted more */
-                float time_diff = (float)(t - center);
-                float time_sigma = (float)ws * 0.15f;  /* Tighter temporal window */
-                float time_weight = expf(-(time_diff * time_diff) / (2.0f * time_sigma * time_sigma));
-
-                weights[t] = range_weight * time_weight;
+                float diff = orig_vals[t] - current_val;
+                float range_weight = expf(-(diff * diff) * inv_2sigma_sq);
+                weights[t] = range_weight * time_weights[t];
                 weight_sum += weights[t];
             }
 
-            /* Weighted average of bandpass-filtered outputs */
+            /* Weighted average */
             if (weight_sum > 1e-8f) {
-                float weighted_output = 0.0f;
+                float inv_weight_sum = 1.0f / weight_sum;
+                float result = 0.0f;
                 for (int t = 0; t < ws; t++) {
-                    weighted_output += (weights[t] / weight_sum) * temp[t];
+                    result += weights[t] * temp[t];
                 }
-                delta_phi_filtered[pos] = weighted_output;
+                delta_phi_filtered[pos] = result * inv_weight_sum;
             } else {
                 delta_phi_filtered[pos] = temp[center];
             }
         } else {
-            /* Non-bilateral: just take center sample */
             delta_phi_filtered[pos] = temp[center];
         }
     }
 
-    mem_free(bandpass_buf);
-
-    mem_free(keep_level);
+    mem_free(orig_vals);
     mem_free(weights);
+    mem_free(haar_work);
     mem_free(temp);
 }
 

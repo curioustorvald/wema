@@ -2,14 +2,15 @@
  * WEMA - Coefficient Amplification
  *
  * Modifies wavelet coefficients to amplify motion.
+ * Optimized for autovectorization.
  */
 
 #include "phase_amp.h"
 
 #include <math.h>
 
-void coeff_amplify(const float *delta_coeff,
-                   const float *orig_coeff,
+void coeff_amplify(const float * restrict delta_coeff,
+                   const float * restrict orig_coeff,
                    float alpha,
                    DWTCoeffs *coeffs) {
     /* Compute total positions for statistics */
@@ -20,39 +21,34 @@ void coeff_amplify(const float *delta_coeff,
         total_pos += sub_size * WEMA_NUM_ORIENTATIONS;
     }
 
-    /* Compute coefficient magnitude statistics for adaptive thresholding */
+    /* Compute coefficient magnitude statistics - vectorizable */
     float mag_sum = 0.0f;
     for (size_t i = 0; i < total_pos; i++) {
-        float m = orig_coeff[i];
-        mag_sum += (m > 0) ? m : -m;
+        mag_sum += fabsf(orig_coeff[i]);
     }
-    float mag_mean = mag_sum / (float)total_pos;
-    float coeff_threshold = mag_mean * 0.2f;  /* 20% of mean magnitude */
+    const float coeff_threshold = mag_sum / (float)total_pos * 0.2f;
 
-    /* Apply amplification */
+    /* Apply amplification per level */
     size_t pos = 0;
 
     for (int lev = 0; lev < coeffs->num_levels; lev++) {
         /* Scale weighting - slight attenuation at finest level */
-        float scale_weight = (lev == 0) ? 0.5f : 1.0f;
-        float level_alpha = alpha * scale_weight;
+        const float level_alpha = alpha * ((lev == 0) ? 0.5f : 1.0f);
 
         for (int o = 0; o < WEMA_NUM_ORIENTATIONS; o++) {
             Subband *sub = &coeffs->subbands[lev][o];
-            int n = sub->width * sub->height;
+            float * restrict out = sub->coeffs;
+            const int n = sub->width * sub->height;
 
+            /* Vectorizable inner loop using branchless select */
             for (int i = 0; i < n; i++) {
-                float orig = orig_coeff[pos];
-                float orig_abs = (orig > 0) ? orig : -orig;
+                const float orig = orig_coeff[pos];
+                const float delta = delta_coeff[pos];
 
-                float new_val;
-                if (level_alpha > 0.0f && orig_abs > coeff_threshold) {
-                    new_val = orig + level_alpha * delta_coeff[pos];
-                } else {
-                    new_val = orig;
-                }
+                /* Branchless: apply amplification only if above threshold */
+                const float mask = (fabsf(orig) > coeff_threshold) ? 1.0f : 0.0f;
+                out[i] = orig + mask * level_alpha * delta;
 
-                sub->coeffs[i] = new_val;
                 pos++;
             }
         }

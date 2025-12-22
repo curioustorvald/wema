@@ -24,93 +24,137 @@
 #define K_INV  (1.0f / K)
 
 /*============================================================================
- * 1D CDF 9/7 Lifting Implementation
+ * 1D CDF 9/7 Lifting Implementation (Vectorization-Optimized)
+ *
+ * Uses split even/odd arrays for stride-1 access patterns.
+ * temp layout: [even samples (half)] [odd samples (odd_n)]
  *===========================================================================*/
 
-static void cdf97_fwd_1d(float *data, int n, float *temp) {
+static void cdf97_fwd_1d(float * restrict data, int n, float * restrict temp) {
     if (n < 2) return;
 
-    int half = (n + 1) / 2;
-    int odd_n = n / 2;
+    const int half = (n + 1) / 2;
+    const int odd_n = n / 2;
 
-    memcpy(temp, data, n * sizeof(float));
+    /* Split into even/odd - stride-1 writes */
+    float * restrict even = temp;
+    float * restrict odd = temp + half;
 
-    /* Predict 1 */
     for (int i = 0; i < odd_n; i++) {
-        int right = (2*i+2 < n) ? 2*i+2 : 2*i;
-        temp[2*i+1] += ALPHA * (temp[2*i] + temp[right]);
+        even[i] = data[2 * i];
+        odd[i] = data[2 * i + 1];
+    }
+    if (half > odd_n) {
+        even[odd_n] = data[2 * odd_n];
     }
 
-    /* Update 1 */
+    /* Predict 1: odd[i] += ALPHA * (even[i] + even[i+1]) */
+    for (int i = 0; i < odd_n - 1; i++) {
+        odd[i] += ALPHA * (even[i] + even[i + 1]);
+    }
+    if (odd_n > 0) {
+        /* Boundary: reflect */
+        odd[odd_n - 1] += ALPHA * (even[odd_n - 1] + even[half > odd_n ? odd_n : odd_n - 1]);
+    }
+
+    /* Update 1: even[i] += BETA * (odd[i-1] + odd[i]) */
+    if (odd_n > 0) {
+        even[0] += BETA * (odd[0] + odd[0]);  /* Reflect left boundary */
+        for (int i = 1; i < half; i++) {
+            int left = i - 1;
+            int right = (i < odd_n) ? i : odd_n - 1;
+            even[i] += BETA * (odd[left] + odd[right]);
+        }
+    }
+
+    /* Predict 2: odd[i] += GAMMA * (even[i] + even[i+1]) */
+    for (int i = 0; i < odd_n - 1; i++) {
+        odd[i] += GAMMA * (even[i] + even[i + 1]);
+    }
+    if (odd_n > 0) {
+        odd[odd_n - 1] += GAMMA * (even[odd_n - 1] + even[half > odd_n ? odd_n : odd_n - 1]);
+    }
+
+    /* Update 2: even[i] += DELTA * (odd[i-1] + odd[i]) */
+    if (odd_n > 0) {
+        even[0] += DELTA * (odd[0] + odd[0]);
+        for (int i = 1; i < half; i++) {
+            int left = i - 1;
+            int right = (i < odd_n) ? i : odd_n - 1;
+            even[i] += DELTA * (odd[left] + odd[right]);
+        }
+    }
+
+    /* Scale and output - vectorizable */
     for (int i = 0; i < half; i++) {
-        int left = (i > 0) ? 2*i-1 : 1;
-        int right = (2*i+1 < n) ? 2*i+1 : left;
-        if (odd_n > 0)
-            temp[2*i] += BETA * (temp[left] + temp[right]);
+        data[i] = even[i] * K_INV;
     }
-
-    /* Predict 2 */
     for (int i = 0; i < odd_n; i++) {
-        int right = (2*i+2 < n) ? 2*i+2 : 2*i;
-        temp[2*i+1] += GAMMA * (temp[2*i] + temp[right]);
+        data[half + i] = odd[i] * K;
     }
-
-    /* Update 2 */
-    for (int i = 0; i < half; i++) {
-        int left = (i > 0) ? 2*i-1 : 1;
-        int right = (2*i+1 < n) ? 2*i+1 : left;
-        if (odd_n > 0)
-            temp[2*i] += DELTA * (temp[left] + temp[right]);
-    }
-
-    /* Scale and pack */
-    for (int i = 0; i < half; i++)
-        data[i] = temp[2*i] * K_INV;
-    for (int i = 0; i < odd_n; i++)
-        data[half + i] = temp[2*i+1] * K;
 }
 
-static void cdf97_inv_1d(float *data, int n, float *temp) {
+static void cdf97_inv_1d(float * restrict data, int n, float * restrict temp) {
     if (n < 2) return;
 
-    int half = (n + 1) / 2;
-    int odd_n = n / 2;
+    const int half = (n + 1) / 2;
+    const int odd_n = n / 2;
 
-    /* Unpack and unscale */
-    for (int i = 0; i < half; i++)
-        temp[2*i] = data[i] * K;
-    for (int i = 0; i < odd_n; i++)
-        temp[2*i+1] = data[half + i] * K_INV;
+    float * restrict even = temp;
+    float * restrict odd = temp + half;
+
+    /* Unpack and unscale - vectorizable */
+    for (int i = 0; i < half; i++) {
+        even[i] = data[i] * K;
+    }
+    for (int i = 0; i < odd_n; i++) {
+        odd[i] = data[half + i] * K_INV;
+    }
 
     /* Inverse update 2 */
-    for (int i = 0; i < half; i++) {
-        int left = (i > 0) ? 2*i-1 : 1;
-        int right = (2*i+1 < n) ? 2*i+1 : left;
-        if (odd_n > 0)
-            temp[2*i] -= DELTA * (temp[left] + temp[right]);
+    if (odd_n > 0) {
+        even[0] -= DELTA * (odd[0] + odd[0]);
+        for (int i = 1; i < half; i++) {
+            int left = i - 1;
+            int right = (i < odd_n) ? i : odd_n - 1;
+            even[i] -= DELTA * (odd[left] + odd[right]);
+        }
     }
 
     /* Inverse predict 2 */
-    for (int i = 0; i < odd_n; i++) {
-        int right = (2*i+2 < n) ? 2*i+2 : 2*i;
-        temp[2*i+1] -= GAMMA * (temp[2*i] + temp[right]);
+    for (int i = 0; i < odd_n - 1; i++) {
+        odd[i] -= GAMMA * (even[i] + even[i + 1]);
+    }
+    if (odd_n > 0) {
+        odd[odd_n - 1] -= GAMMA * (even[odd_n - 1] + even[half > odd_n ? odd_n : odd_n - 1]);
     }
 
     /* Inverse update 1 */
-    for (int i = 0; i < half; i++) {
-        int left = (i > 0) ? 2*i-1 : 1;
-        int right = (2*i+1 < n) ? 2*i+1 : left;
-        if (odd_n > 0)
-            temp[2*i] -= BETA * (temp[left] + temp[right]);
+    if (odd_n > 0) {
+        even[0] -= BETA * (odd[0] + odd[0]);
+        for (int i = 1; i < half; i++) {
+            int left = i - 1;
+            int right = (i < odd_n) ? i : odd_n - 1;
+            even[i] -= BETA * (odd[left] + odd[right]);
+        }
     }
 
     /* Inverse predict 1 */
-    for (int i = 0; i < odd_n; i++) {
-        int right = (2*i+2 < n) ? 2*i+2 : 2*i;
-        temp[2*i+1] -= ALPHA * (temp[2*i] + temp[right]);
+    for (int i = 0; i < odd_n - 1; i++) {
+        odd[i] -= ALPHA * (even[i] + even[i + 1]);
+    }
+    if (odd_n > 0) {
+        odd[odd_n - 1] -= ALPHA * (even[odd_n - 1] + even[half > odd_n ? odd_n : odd_n - 1]);
     }
 
-    memcpy(data, temp, n * sizeof(float));
+    /* Interleave back - stride-1 reads */
+    for (int i = 0; i < odd_n; i++) {
+        data[2 * i] = even[i];
+        data[2 * i + 1] = odd[i];
+    }
+    if (half > odd_n) {
+        data[2 * odd_n] = even[odd_n];
+    }
 }
 
 /*============================================================================
