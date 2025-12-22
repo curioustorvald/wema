@@ -29,6 +29,7 @@ static void print_usage(const char *prog) {
         "  --temporal-window <n>  Temporal window size (default: 32, min:4, max: 256)\n"
         "  --no-edge-aware        Disable edge-aware guided filter\n"
         "  --no-bilateral         Disable bilateral temporal filtering\n"
+        "  --color                Enable color mode (amplify colour channels)\n"
         "  -v, --verbose          Verbose output\n"
         "  -h, --help             Show this help\n"
         "\n"
@@ -154,6 +155,9 @@ static int parse_args(int argc, char **argv, WemaConfig *config) {
         else if (strcmp(argv[i], "--no-bilateral") == 0) {
             config->bilateral_temp = false;
         }
+        else if (strcmp(argv[i], "--color") == 0) {
+            config->color_mode = true;
+        }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             exit(0);
@@ -218,6 +222,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  Temporal window: %d frames\n", config.temporal_window);
         fprintf(stderr, "  Bilateral temporal: %s\n", config.bilateral_temp ? "enabled" : "disabled");
         fprintf(stderr, "  Edge-aware filter: %s\n", config.edge_aware ? "enabled" : "disabled");
+        fprintf(stderr, "  Color mode: %s\n", config.color_mode ? "enabled" : "disabled");
     }
 
     /* Initialize WEMA context */
@@ -232,6 +237,18 @@ int main(int argc, char **argv) {
     }
     ctx.edge_aware = config.edge_aware;
     ctx.bilateral_temp = config.bilateral_temp;
+    ctx.color_mode = config.color_mode;
+
+    /* Initialize color mode buffers if enabled */
+    if (config.color_mode) {
+        if (wema_init_color(&ctx) < 0) {
+            fprintf(stderr, "Error: Failed to initialize color mode\n");
+            wema_free(&ctx);
+            ffio_close_input(&io_in);
+            mem_free(auto_output);
+            return 1;
+        }
+    }
 
     /* Open output */
     FFmpegIO io_out = {0};

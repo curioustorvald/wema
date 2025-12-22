@@ -63,6 +63,7 @@ wema -i input.mp4 -v
 | `--temporal-window <n>` | Temporal window size (4-256) | 32 |
 | `--no-edge-aware` | Disable edge-aware guided filter | enabled |
 | `--no-bilateral` | Disable bilateral temporal filtering | enabled |
+| `--color` | Enable color difference amplification | disabled |
 | `--ff-codec <codec>` | FFmpeg video codec | ffv1 |
 | `--ff-option <opts>` | FFmpeg encoder options | - |
 | `-v, --verbose` | Verbose output | off |
@@ -88,18 +89,6 @@ wema -i input.mp4 -v
 - **Medical imaging** - Detect pulse, breathing, blood flow
 - **Industrial inspection** - Reveal machine vibrations
 - **Scientific visualization** - Observe subtle physical phenomena
-
-## Performance
-
-The implementation is optimized for modern CPUs:
-
-- Prefix-sum box filter for O(1) per-pixel guided filtering
-- Split even/odd DWT lifting for stride-1 vectorization
-- Pre-allocated work buffers to minimize allocations
-- Branchless coefficient thresholding
-- `restrict` pointers throughout for alias analysis
-
-Build with `make all` to enable `-Ofast -march=native` optimizations.
 
 ## References
 

@@ -50,6 +50,57 @@ void frame_rgb_to_gray(const Frame *rgb, float * restrict gray) {
 }
 
 /*============================================================================
+ * YCbCr Color Space Conversion (BT.601)
+ *
+ * Used for color mode processing - amplify Cb/Cr channels for blood flow.
+ * RGB values expected in [0, 1], Cb/Cr centered at 0.5.
+ *===========================================================================*/
+
+static void frame_rgb_to_ycbcr(const Frame *rgb,
+                                float * restrict y,
+                                float * restrict cb,
+                                float * restrict cr) {
+    const int n = rgb->width * rgb->height;
+    const float * restrict src = rgb->data;
+
+    /* BT.601 RGB to YCbCr (Cb/Cr centered at 0.5 for [0,1] range) */
+    for (int i = 0; i < n; i++) {
+        const int idx = i * 3;
+        const float r = src[idx + 0];
+        const float g = src[idx + 1];
+        const float b = src[idx + 2];
+
+        y[i]  =  0.299f * r + 0.587f * g + 0.114f * b;
+        cb[i] = -0.169f * r - 0.331f * g + 0.500f * b + 0.5f;
+        cr[i] =  0.500f * r - 0.419f * g - 0.081f * b + 0.5f;
+    }
+}
+
+static void frame_ycbcr_to_rgb(const float * restrict y,
+                                const float * restrict cb,
+                                const float * restrict cr,
+                                Frame *rgb) {
+    const int n = rgb->width * rgb->height;
+    float * restrict dst = rgb->data;
+
+    /* BT.601 YCbCr to RGB */
+    for (int i = 0; i < n; i++) {
+        const float y_val = y[i];
+        const float cb_val = cb[i] - 0.5f;  /* Re-center to [-0.5, 0.5] */
+        const float cr_val = cr[i] - 0.5f;
+
+        float r = y_val + 1.402f * cr_val;
+        float g = y_val - 0.344f * cb_val - 0.714f * cr_val;
+        float b = y_val + 1.772f * cb_val;
+
+        /* Clamp to [0, 1] */
+        dst[i * 3 + 0] = (r < 0.0f) ? 0.0f : ((r > 1.0f) ? 1.0f : r);
+        dst[i * 3 + 1] = (g < 0.0f) ? 0.0f : ((g > 1.0f) ? 1.0f : g);
+        dst[i * 3 + 2] = (b < 0.0f) ? 0.0f : ((b > 1.0f) ? 1.0f : b);
+    }
+}
+
+/*============================================================================
  * Guided Filter Implementation
  *
  * Edge-preserving filter that uses a guide image (original luminance)
@@ -318,6 +369,7 @@ int wema_init(WemaContext *ctx, int width, int height, float fps,
     ctx->temporal_window = temporal_window;
     ctx->edge_aware = true;       /* Enable by default */
     ctx->bilateral_temp = true;   /* Enable by default */
+    ctx->color_mode = false;      /* Disabled by default, set after init */
 
     /* Compute normalized frequencies */
     ctx->f_low_norm = f_low / (fps / 2.0f);
@@ -330,7 +382,7 @@ int wema_init(WemaContext *ctx, int width, int height, float fps,
     /* Compute number of DWT levels */
     ctx->num_levels = dwt_compute_levels(width, height);
 
-    /* Allocate DWT coefficients */
+    /* Allocate DWT coefficients (Y channel) */
     ctx->coeffs = mem_alloc(sizeof(DWTCoeffs));
     if (!ctx->coeffs) goto error;
 
@@ -338,7 +390,7 @@ int wema_init(WemaContext *ctx, int width, int height, float fps,
         goto error;
     }
 
-    /* Allocate temporal buffer */
+    /* Allocate temporal buffer (Y channel) */
     ctx->temporal_buf = mem_alloc(sizeof(TemporalBuffer));
     if (!ctx->temporal_buf) goto error;
 
@@ -386,7 +438,57 @@ error:
     return -1;
 }
 
+/* Initialize chrominance buffers for color mode (call after wema_init) */
+int wema_init_color(WemaContext *ctx) {
+    size_t pixels = (size_t)ctx->width * ctx->height;
+
+    /* Allocate DWT coefficients for Cb and Cr */
+    ctx->coeffs_cb = mem_alloc(sizeof(DWTCoeffs));
+    ctx->coeffs_cr = mem_alloc(sizeof(DWTCoeffs));
+    if (!ctx->coeffs_cb || !ctx->coeffs_cr) goto error;
+
+    if (dwt_init(ctx->coeffs_cb, ctx->width, ctx->height, ctx->num_levels) < 0) {
+        goto error;
+    }
+    if (dwt_init(ctx->coeffs_cr, ctx->width, ctx->height, ctx->num_levels) < 0) {
+        goto error;
+    }
+
+    /* Allocate temporal buffers for Cb and Cr */
+    ctx->temporal_buf_cb = mem_alloc(sizeof(TemporalBuffer));
+    ctx->temporal_buf_cr = mem_alloc(sizeof(TemporalBuffer));
+    if (!ctx->temporal_buf_cb || !ctx->temporal_buf_cr) goto error;
+
+    if (temporal_buffer_init(ctx->temporal_buf_cb, ctx->coeffs_cb,
+                             ctx->temporal_window) < 0) {
+        goto error;
+    }
+    if (temporal_buffer_init(ctx->temporal_buf_cr, ctx->coeffs_cr,
+                             ctx->temporal_window) < 0) {
+        goto error;
+    }
+
+    /* Allocate chrominance work buffers */
+    ctx->cb_in = mem_alloc(pixels * sizeof(float));
+    ctx->cr_in = mem_alloc(pixels * sizeof(float));
+    ctx->cb_out = mem_alloc(pixels * sizeof(float));
+    ctx->cr_out = mem_alloc(pixels * sizeof(float));
+    ctx->delta_cb = mem_alloc(ctx->temporal_buf->num_positions * sizeof(float));
+    ctx->delta_cr = mem_alloc(ctx->temporal_buf->num_positions * sizeof(float));
+
+    if (!ctx->cb_in || !ctx->cr_in || !ctx->cb_out || !ctx->cr_out ||
+        !ctx->delta_cb || !ctx->delta_cr) {
+        goto error;
+    }
+
+    return 0;
+
+error:
+    return -1;
+}
+
 void wema_free(WemaContext *ctx) {
+    /* Free Y channel state */
     if (ctx->coeffs) {
         dwt_free(ctx->coeffs);
         mem_free(ctx->coeffs);
@@ -402,6 +504,30 @@ void wema_free(WemaContext *ctx) {
         mem_free(ctx->temporal_filt);
         ctx->temporal_filt = NULL;
     }
+
+    /* Free chrominance state (color mode) */
+    if (ctx->coeffs_cb) {
+        dwt_free(ctx->coeffs_cb);
+        mem_free(ctx->coeffs_cb);
+        ctx->coeffs_cb = NULL;
+    }
+    if (ctx->coeffs_cr) {
+        dwt_free(ctx->coeffs_cr);
+        mem_free(ctx->coeffs_cr);
+        ctx->coeffs_cr = NULL;
+    }
+    if (ctx->temporal_buf_cb) {
+        temporal_buffer_free(ctx->temporal_buf_cb);
+        mem_free(ctx->temporal_buf_cb);
+        ctx->temporal_buf_cb = NULL;
+    }
+    if (ctx->temporal_buf_cr) {
+        temporal_buffer_free(ctx->temporal_buf_cr);
+        mem_free(ctx->temporal_buf_cr);
+        ctx->temporal_buf_cr = NULL;
+    }
+
+    /* Free Y channel work buffers */
     mem_free(ctx->gray_in);
     mem_free(ctx->gray_out);
     mem_free(ctx->delta_phi);
@@ -418,6 +544,20 @@ void wema_free(WemaContext *ctx) {
     ctx->delta_buf = NULL;
     ctx->smooth_buf = NULL;
     ctx->guide_buf = NULL;
+
+    /* Free chrominance work buffers */
+    mem_free(ctx->cb_in);
+    mem_free(ctx->cr_in);
+    mem_free(ctx->cb_out);
+    mem_free(ctx->cr_out);
+    mem_free(ctx->delta_cb);
+    mem_free(ctx->delta_cr);
+    ctx->cb_in = NULL;
+    ctx->cr_in = NULL;
+    ctx->cb_out = NULL;
+    ctx->cr_out = NULL;
+    ctx->delta_cb = NULL;
+    ctx->delta_cr = NULL;
 }
 
 bool wema_ready(const WemaContext *ctx) {
@@ -425,41 +565,96 @@ bool wema_ready(const WemaContext *ctx) {
 }
 
 int wema_process_frame(WemaContext *ctx, const Frame *in, Frame *out) {
-    /* Step 1: RGB to grayscale */
-    frame_rgb_to_gray(in, ctx->gray_in);
+    const size_t pixels = (size_t)ctx->width * ctx->height;
 
-    /* Step 2: 2D DWT forward transform */
-    dwt_forward(ctx->gray_in, ctx->width, ctx->height, ctx->coeffs);
+    if (ctx->color_mode) {
+        /* Color mode: Process Y, Cb, Cr separately */
 
-    /* Step 3: Push coefficients to temporal buffer */
-    temporal_buffer_push(ctx->temporal_buf, ctx->coeffs);
+        /* Step 1: RGB to YCbCr */
+        frame_rgb_to_ycbcr(in, ctx->gray_in, ctx->cb_in, ctx->cr_in);
 
-    /* Check if we have enough frames for filtering */
-    if (!temporal_buffer_ready(ctx->temporal_buf)) {
-        /* Not ready yet - copy input to output */
-        memcpy(out->data, in->data,
-               (size_t)in->width * in->height * in->channels * sizeof(float));
-        return 0;
+        /* Step 2: 2D DWT forward transform for all channels */
+        dwt_forward(ctx->gray_in, ctx->width, ctx->height, ctx->coeffs);
+        dwt_forward(ctx->cb_in, ctx->width, ctx->height, ctx->coeffs_cb);
+        dwt_forward(ctx->cr_in, ctx->width, ctx->height, ctx->coeffs_cr);
+
+        /* Step 3: Push coefficients to temporal buffers */
+        temporal_buffer_push(ctx->temporal_buf, ctx->coeffs);
+        temporal_buffer_push(ctx->temporal_buf_cb, ctx->coeffs_cb);
+        temporal_buffer_push(ctx->temporal_buf_cr, ctx->coeffs_cr);
+
+        /* Check if we have enough frames for filtering */
+        if (!temporal_buffer_ready(ctx->temporal_buf)) {
+            /* Not ready yet - copy input to output */
+            memcpy(out->data, in->data,
+                   pixels * in->channels * sizeof(float));
+            return 0;
+        }
+
+        /* Step 4: Temporal band-pass filtering (with optional bilateral) */
+        temporal_filter_apply(ctx->temporal_filt, ctx->temporal_buf,
+                              ctx->delta_phi, ctx->bilateral_temp);
+        temporal_filter_apply(ctx->temporal_filt, ctx->temporal_buf_cb,
+                              ctx->delta_cb, ctx->bilateral_temp);
+        temporal_filter_apply(ctx->temporal_filt, ctx->temporal_buf_cr,
+                              ctx->delta_cr, ctx->bilateral_temp);
+
+        /* Step 5: Coefficient amplification for all channels */
+        coeff_amplify(ctx->delta_phi, ctx->temporal_buf->amplitude,
+                      ctx->amp_factor, ctx->coeffs);
+        /* Chrominance uses reduced amplification (blood flow subtle) */
+        coeff_amplify(ctx->delta_cb, ctx->temporal_buf_cb->amplitude,
+                      ctx->amp_factor * 0.5f, ctx->coeffs_cb);
+        coeff_amplify(ctx->delta_cr, ctx->temporal_buf_cr->amplitude,
+                      ctx->amp_factor * 0.5f, ctx->coeffs_cr);
+
+        /* Step 6: 2D DWT inverse transform for all channels */
+        dwt_inverse(ctx->coeffs, ctx->gray_out);
+        dwt_inverse(ctx->coeffs_cb, ctx->cb_out);
+        dwt_inverse(ctx->coeffs_cr, ctx->cr_out);
+
+        /* Step 7: YCbCr to RGB */
+        frame_ycbcr_to_rgb(ctx->gray_out, ctx->cb_out, ctx->cr_out, out);
+
+    } else {
+        /* Standard mode: Process luminance only */
+
+        /* Step 1: RGB to grayscale */
+        frame_rgb_to_gray(in, ctx->gray_in);
+
+        /* Step 2: 2D DWT forward transform */
+        dwt_forward(ctx->gray_in, ctx->width, ctx->height, ctx->coeffs);
+
+        /* Step 3: Push coefficients to temporal buffer */
+        temporal_buffer_push(ctx->temporal_buf, ctx->coeffs);
+
+        /* Check if we have enough frames for filtering */
+        if (!temporal_buffer_ready(ctx->temporal_buf)) {
+            /* Not ready yet - copy input to output */
+            memcpy(out->data, in->data,
+                   pixels * in->channels * sizeof(float));
+            return 0;
+        }
+
+        /* Step 4: Temporal band-pass filtering (with optional bilateral) */
+        temporal_filter_apply(ctx->temporal_filt, ctx->temporal_buf,
+                              ctx->delta_phi, ctx->bilateral_temp);
+
+        /* Step 5: Coefficient amplification */
+        coeff_amplify(ctx->delta_phi, ctx->temporal_buf->amplitude,
+                      ctx->amp_factor, ctx->coeffs);
+
+        /* Step 6: 2D DWT inverse transform */
+        dwt_inverse(ctx->coeffs, ctx->gray_out);
+
+        /* Step 7: Grayscale to RGB with edge-aware smoothing */
+        frame_gray_to_rgb_ex(ctx->gray_out, in, out,
+                             ctx->delta_buf, ctx->smooth_buf,
+                             ctx->guide_buf,
+                             ctx->guided_work[0], ctx->guided_work[1],
+                             ctx->guided_work[2], ctx->guided_work[3],
+                             ctx->edge_aware);
     }
-
-    /* Step 4: Temporal band-pass filtering (with optional bilateral) */
-    temporal_filter_apply(ctx->temporal_filt, ctx->temporal_buf, ctx->delta_phi,
-                          ctx->bilateral_temp);
-
-    /* Step 5: Coefficient amplification */
-    coeff_amplify(ctx->delta_phi, ctx->temporal_buf->amplitude,
-                  ctx->amp_factor, ctx->coeffs);
-
-    /* Step 6: 2D DWT inverse transform */
-    dwt_inverse(ctx->coeffs, ctx->gray_out);
-
-    /* Step 7: Grayscale to RGB with edge-aware smoothing */
-    frame_gray_to_rgb_ex(ctx->gray_out, in, out,
-                         ctx->delta_buf, ctx->smooth_buf,
-                         ctx->guide_buf,
-                         ctx->guided_work[0], ctx->guided_work[1],
-                         ctx->guided_work[2], ctx->guided_work[3],
-                         ctx->edge_aware);
 
     return 0;
 }
