@@ -3,6 +3,7 @@
  *
  * Implementation using CDF 9/7 biorthogonal wavelets via lifting scheme.
  * Uses standard dyadic decomposition with uniform subband sizes.
+ * AVX-512 optimized for batch column processing.
  */
 
 #include "dwt.h"
@@ -11,6 +12,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+/* AVX-512 support detection */
+#if defined(__AVX512F__)
+#define USE_AVX512 1
+#include <immintrin.h>
+#else
+#define USE_AVX512 0
+#endif
+
+/* AVX-512 processes 16 floats at once */
+#define SIMD_WIDTH 16
 
 /*============================================================================
  * CDF 9/7 Lifting Coefficients
@@ -85,7 +97,7 @@ static void cdf97_fwd_1d(float * restrict data, int n, float * restrict temp) {
         }
     }
 
-    /* Scale and output - vectorizable */
+    /* Scale and output */
     for (int i = 0; i < half; i++) {
         data[i] = even[i] * K_INV;
     }
@@ -103,7 +115,7 @@ static void cdf97_inv_1d(float * restrict data, int n, float * restrict temp) {
     float * restrict even = temp;
     float * restrict odd = temp + half;
 
-    /* Unpack and unscale - vectorizable */
+    /* Unpack and unscale */
     for (int i = 0; i < half; i++) {
         even[i] = data[i] * K;
     }
@@ -158,6 +170,199 @@ static void cdf97_inv_1d(float * restrict data, int n, float * restrict temp) {
 }
 
 /*============================================================================
+ * AVX-512 Column Processing (16 columns at once)
+ *
+ * Instead of gather/scatter for each column, we:
+ * - Load row[y] as a vector (16 consecutive columns)
+ * - Apply lifting steps where each lane is an independent column
+ * - Store row[y] back
+ *===========================================================================*/
+
+#if USE_AVX512
+
+/*
+ * Forward CDF 9/7 on 16 columns simultaneously.
+ * img: pointer to first column of the 16-column block
+ * w: image width (stride between rows)
+ * h: image height (number of rows to process)
+ * even_out, odd_out: output buffers [half][16] floats
+ * even_work, odd_work: pre-allocated work buffers [half * sizeof(__m512)]
+ */
+static void cdf97_fwd_cols_avx512(const float *img, int w, int h,
+                                   float *even_out, float *odd_out,
+                                   void *even_work, void *odd_work) {
+    if (h < 2) return;
+
+    const int half = (h + 1) / 2;
+    const int odd_n = h / 2;
+
+    const __m512 v_alpha = _mm512_set1_ps(ALPHA);
+    const __m512 v_beta = _mm512_set1_ps(BETA);
+    const __m512 v_gamma = _mm512_set1_ps(GAMMA);
+    const __m512 v_delta = _mm512_set1_ps(DELTA);
+    const __m512 v_k = _mm512_set1_ps(K);
+    const __m512 v_k_inv = _mm512_set1_ps(K_INV);
+
+    /* Use pre-allocated work buffers */
+    __m512 *even = (__m512 *)even_work;
+    __m512 *odd = (__m512 *)odd_work;
+
+    /* Split into even/odd rows - load 16 columns at once */
+    for (int i = 0; i < odd_n; i++) {
+        even[i] = _mm512_loadu_ps(&img[(2 * i) * w]);
+        odd[i] = _mm512_loadu_ps(&img[(2 * i + 1) * w]);
+    }
+    if (half > odd_n) {
+        even[odd_n] = _mm512_loadu_ps(&img[(2 * odd_n) * w]);
+    }
+
+    /* Predict 1: odd[i] += ALPHA * (even[i] + even[i+1]) */
+    for (int i = 0; i < odd_n - 1; i++) {
+        __m512 sum = _mm512_add_ps(even[i], even[i + 1]);
+        odd[i] = _mm512_fmadd_ps(v_alpha, sum, odd[i]);
+    }
+    if (odd_n > 0) {
+        int right_idx = (half > odd_n) ? odd_n : odd_n - 1;
+        __m512 sum = _mm512_add_ps(even[odd_n - 1], even[right_idx]);
+        odd[odd_n - 1] = _mm512_fmadd_ps(v_alpha, sum, odd[odd_n - 1]);
+    }
+
+    /* Update 1: even[i] += BETA * (odd[i-1] + odd[i]) */
+    if (odd_n > 0) {
+        __m512 sum = _mm512_add_ps(odd[0], odd[0]);
+        even[0] = _mm512_fmadd_ps(v_beta, sum, even[0]);
+        for (int i = 1; i < half; i++) {
+            int left = i - 1;
+            int right = (i < odd_n) ? i : odd_n - 1;
+            sum = _mm512_add_ps(odd[left], odd[right]);
+            even[i] = _mm512_fmadd_ps(v_beta, sum, even[i]);
+        }
+    }
+
+    /* Predict 2: odd[i] += GAMMA * (even[i] + even[i+1]) */
+    for (int i = 0; i < odd_n - 1; i++) {
+        __m512 sum = _mm512_add_ps(even[i], even[i + 1]);
+        odd[i] = _mm512_fmadd_ps(v_gamma, sum, odd[i]);
+    }
+    if (odd_n > 0) {
+        int right_idx = (half > odd_n) ? odd_n : odd_n - 1;
+        __m512 sum = _mm512_add_ps(even[odd_n - 1], even[right_idx]);
+        odd[odd_n - 1] = _mm512_fmadd_ps(v_gamma, sum, odd[odd_n - 1]);
+    }
+
+    /* Update 2: even[i] += DELTA * (odd[i-1] + odd[i]) */
+    if (odd_n > 0) {
+        __m512 sum = _mm512_add_ps(odd[0], odd[0]);
+        even[0] = _mm512_fmadd_ps(v_delta, sum, even[0]);
+        for (int i = 1; i < half; i++) {
+            int left = i - 1;
+            int right = (i < odd_n) ? i : odd_n - 1;
+            sum = _mm512_add_ps(odd[left], odd[right]);
+            even[i] = _mm512_fmadd_ps(v_delta, sum, even[i]);
+        }
+    }
+
+    /* Scale and store output */
+    for (int i = 0; i < half; i++) {
+        __m512 scaled = _mm512_mul_ps(even[i], v_k_inv);
+        _mm512_storeu_ps(&even_out[i * SIMD_WIDTH], scaled);
+    }
+    for (int i = 0; i < odd_n; i++) {
+        __m512 scaled = _mm512_mul_ps(odd[i], v_k);
+        _mm512_storeu_ps(&odd_out[i * SIMD_WIDTH], scaled);
+    }
+}
+
+/*
+ * Inverse CDF 9/7 on 16 columns simultaneously.
+ * even_work, odd_work: pre-allocated work buffers [half * sizeof(__m512)]
+ */
+static void cdf97_inv_cols_avx512(const float *even_in, const float *odd_in,
+                                   int h, float *img, int w,
+                                   void *even_work, void *odd_work) {
+    if (h < 2) return;
+
+    const int half = (h + 1) / 2;
+    const int odd_n = h / 2;
+
+    const __m512 v_alpha = _mm512_set1_ps(ALPHA);
+    const __m512 v_beta = _mm512_set1_ps(BETA);
+    const __m512 v_gamma = _mm512_set1_ps(GAMMA);
+    const __m512 v_delta = _mm512_set1_ps(DELTA);
+    const __m512 v_k = _mm512_set1_ps(K);
+    const __m512 v_k_inv = _mm512_set1_ps(K_INV);
+
+    /* Use pre-allocated work buffers */
+    __m512 *even = (__m512 *)even_work;
+    __m512 *odd = (__m512 *)odd_work;
+
+    /* Unpack and unscale */
+    for (int i = 0; i < half; i++) {
+        even[i] = _mm512_mul_ps(_mm512_loadu_ps(&even_in[i * SIMD_WIDTH]), v_k);
+    }
+    for (int i = 0; i < odd_n; i++) {
+        odd[i] = _mm512_mul_ps(_mm512_loadu_ps(&odd_in[i * SIMD_WIDTH]), v_k_inv);
+    }
+
+    /* Inverse update 2 */
+    if (odd_n > 0) {
+        __m512 sum = _mm512_add_ps(odd[0], odd[0]);
+        even[0] = _mm512_fnmadd_ps(v_delta, sum, even[0]);
+        for (int i = 1; i < half; i++) {
+            int left = i - 1;
+            int right = (i < odd_n) ? i : odd_n - 1;
+            sum = _mm512_add_ps(odd[left], odd[right]);
+            even[i] = _mm512_fnmadd_ps(v_delta, sum, even[i]);
+        }
+    }
+
+    /* Inverse predict 2 */
+    for (int i = 0; i < odd_n - 1; i++) {
+        __m512 sum = _mm512_add_ps(even[i], even[i + 1]);
+        odd[i] = _mm512_fnmadd_ps(v_gamma, sum, odd[i]);
+    }
+    if (odd_n > 0) {
+        int right_idx = (half > odd_n) ? odd_n : odd_n - 1;
+        __m512 sum = _mm512_add_ps(even[odd_n - 1], even[right_idx]);
+        odd[odd_n - 1] = _mm512_fnmadd_ps(v_gamma, sum, odd[odd_n - 1]);
+    }
+
+    /* Inverse update 1 */
+    if (odd_n > 0) {
+        __m512 sum = _mm512_add_ps(odd[0], odd[0]);
+        even[0] = _mm512_fnmadd_ps(v_beta, sum, even[0]);
+        for (int i = 1; i < half; i++) {
+            int left = i - 1;
+            int right = (i < odd_n) ? i : odd_n - 1;
+            sum = _mm512_add_ps(odd[left], odd[right]);
+            even[i] = _mm512_fnmadd_ps(v_beta, sum, even[i]);
+        }
+    }
+
+    /* Inverse predict 1 */
+    for (int i = 0; i < odd_n - 1; i++) {
+        __m512 sum = _mm512_add_ps(even[i], even[i + 1]);
+        odd[i] = _mm512_fnmadd_ps(v_alpha, sum, odd[i]);
+    }
+    if (odd_n > 0) {
+        int right_idx = (half > odd_n) ? odd_n : odd_n - 1;
+        __m512 sum = _mm512_add_ps(even[odd_n - 1], even[right_idx]);
+        odd[odd_n - 1] = _mm512_fnmadd_ps(v_alpha, sum, odd[odd_n - 1]);
+    }
+
+    /* Interleave back to image rows */
+    for (int i = 0; i < odd_n; i++) {
+        _mm512_storeu_ps(&img[(2 * i) * w], even[i]);
+        _mm512_storeu_ps(&img[(2 * i + 1) * w], odd[i]);
+    }
+    if (half > odd_n) {
+        _mm512_storeu_ps(&img[(2 * odd_n) * w], even[odd_n]);
+    }
+}
+
+#endif /* USE_AVX512 */
+
+/*============================================================================
  * 2D Separable Transform with uniform subband sizes
  *===========================================================================*/
 
@@ -169,18 +374,81 @@ static void cdf97_2d_forward(float *img, int w, int h,
         cdf97_fwd_1d(img + y * w, w, temp);
     }
 
-    /* Transform columns - need to gather/scatter */
-    float *col = mem_alloc(h * sizeof(float));
-    if (!col) return;
+    /* Transform columns */
+    /*
+     * NOTE: AVX-512 column processing was implemented but provided no speedup
+     * over compiler auto-vectorization. The memory gather/scatter overhead
+     * offsets SIMD gains. Keeping code commented for reference.
+     */
+#if 0 && USE_AVX512  /* Disabled: no speedup over scalar with -Ofast */
+    {
+        const int half_h = (h + 1) / 2;
+        const int odd_h = h / 2;
 
-    for (int x = 0; x < w; x++) {
-        for (int y = 0; y < h; y++)
-            col[y] = img[y * w + x];
-        cdf97_fwd_1d(col, h, temp);
-        for (int y = 0; y < h; y++)
-            img[y * w + x] = col[y];
+        /* Allocate all temporary storage upfront (64-byte aligned for AVX-512) */
+        float *even_cols = mem_alloc(half_h * SIMD_WIDTH * sizeof(float));
+        float *odd_cols = mem_alloc(odd_h * SIMD_WIDTH * sizeof(float));
+        void *even_work = mem_alloc_aligned(64, half_h * sizeof(__m512));
+        void *odd_work = mem_alloc_aligned(64, odd_h * sizeof(__m512));
+        if (!even_cols || !odd_cols || !even_work || !odd_work) {
+            mem_free(even_cols);
+            mem_free(odd_cols);
+            mem_free(even_work);
+            mem_free(odd_work);
+            return;
+        }
+
+        /* Process 16 columns at a time with AVX-512 */
+        int x;
+        for (x = 0; x + SIMD_WIDTH <= w; x += SIMD_WIDTH) {
+            cdf97_fwd_cols_avx512(&img[x], w, h, even_cols, odd_cols,
+                                  even_work, odd_work);
+
+            /* Scatter results back: even rows go to top half, odd to bottom */
+            for (int i = 0; i < half_h; i++) {
+                memcpy(&img[i * w + x], &even_cols[i * SIMD_WIDTH],
+                       SIMD_WIDTH * sizeof(float));
+            }
+            for (int i = 0; i < odd_h; i++) {
+                memcpy(&img[(half_h + i) * w + x], &odd_cols[i * SIMD_WIDTH],
+                       SIMD_WIDTH * sizeof(float));
+            }
+        }
+
+        /* Handle remaining columns with scalar code */
+        float *col = mem_alloc(h * sizeof(float));
+        if (col) {
+            for (; x < w; x++) {
+                for (int y = 0; y < h; y++)
+                    col[y] = img[y * w + x];
+                cdf97_fwd_1d(col, h, temp);
+                for (int y = 0; y < h; y++)
+                    img[y * w + x] = col[y];
+            }
+            mem_free(col);
+        }
+
+        mem_free(even_cols);
+        mem_free(odd_cols);
+        mem_free(even_work);
+        mem_free(odd_work);
     }
-    mem_free(col);
+#else
+    {
+        /* Scalar column processing - compiler auto-vectorizes well with -Ofast */
+        float *col = mem_alloc(h * sizeof(float));
+        if (!col) return;
+
+        for (int x = 0; x < w; x++) {
+            for (int y = 0; y < h; y++)
+                col[y] = img[y * w + x];
+            cdf97_fwd_1d(col, h, temp);
+            for (int y = 0; y < h; y++)
+                img[y * w + x] = col[y];
+        }
+        mem_free(col);
+    }
+#endif
 
     /* Extract subbands - after 2D transform:
      * [LL | HL]   top-left is LL (low freq both dims)
@@ -236,17 +504,76 @@ static void cdf97_2d_inverse(const float *ll, const float *lh,
     }
 
     /* Inverse transform columns */
-    float *col = mem_alloc(h * sizeof(float));
-    if (!col) return;
+#if 0 && USE_AVX512  /* Disabled: no speedup over scalar with -Ofast */
+    {
+        const int half_h = (h + 1) / 2;
+        const int odd_h = h / 2;
 
-    for (int x = 0; x < w; x++) {
-        for (int y = 0; y < h; y++)
-            col[y] = img[y * w + x];
-        cdf97_inv_1d(col, h, temp);
-        for (int y = 0; y < h; y++)
-            img[y * w + x] = col[y];
+        /* Allocate all temporary storage upfront (64-byte aligned for AVX-512) */
+        float *even_cols = mem_alloc(half_h * SIMD_WIDTH * sizeof(float));
+        float *odd_cols = mem_alloc(odd_h * SIMD_WIDTH * sizeof(float));
+        void *even_work = mem_alloc_aligned(64, half_h * sizeof(__m512));
+        void *odd_work = mem_alloc_aligned(64, odd_h * sizeof(__m512));
+        if (!even_cols || !odd_cols || !even_work || !odd_work) {
+            mem_free(even_cols);
+            mem_free(odd_cols);
+            mem_free(even_work);
+            mem_free(odd_work);
+            return;
+        }
+
+        /* Process 16 columns at a time with AVX-512 */
+        int x;
+        for (x = 0; x + SIMD_WIDTH <= w; x += SIMD_WIDTH) {
+            /* Gather even (top half) and odd (bottom half) rows */
+            for (int i = 0; i < half_h; i++) {
+                memcpy(&even_cols[i * SIMD_WIDTH], &img[i * w + x],
+                       SIMD_WIDTH * sizeof(float));
+            }
+            for (int i = 0; i < odd_h; i++) {
+                memcpy(&odd_cols[i * SIMD_WIDTH], &img[(half_h + i) * w + x],
+                       SIMD_WIDTH * sizeof(float));
+            }
+
+            /* Apply inverse transform to 16 columns */
+            cdf97_inv_cols_avx512(even_cols, odd_cols, h, &img[x], w,
+                                  even_work, odd_work);
+        }
+
+        /* Handle remaining columns with scalar code */
+        float *col = mem_alloc(h * sizeof(float));
+        if (col) {
+            for (; x < w; x++) {
+                for (int y = 0; y < h; y++)
+                    col[y] = img[y * w + x];
+                cdf97_inv_1d(col, h, temp);
+                for (int y = 0; y < h; y++)
+                    img[y * w + x] = col[y];
+            }
+            mem_free(col);
+        }
+
+        mem_free(even_cols);
+        mem_free(odd_cols);
+        mem_free(even_work);
+        mem_free(odd_work);
     }
-    mem_free(col);
+#else
+    {
+        /* Scalar column processing - compiler auto-vectorizes well with -Ofast */
+        float *col = mem_alloc(h * sizeof(float));
+        if (!col) return;
+
+        for (int x = 0; x < w; x++) {
+            for (int y = 0; y < h; y++)
+                col[y] = img[y * w + x];
+            cdf97_inv_1d(col, h, temp);
+            for (int y = 0; y < h; y++)
+                img[y * w + x] = col[y];
+        }
+        mem_free(col);
+    }
+#endif
 
     /* Inverse transform rows */
     for (int y = 0; y < h; y++) {

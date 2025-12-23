@@ -39,14 +39,25 @@ typedef struct {
 } IIRFilterCoeffs;
 
 /*
+ * SoA (Structure of Arrays) state layout for SIMD processing
+ * All w1 values for one section are contiguous, enabling AVX-512 loads
+ */
+typedef struct {
+    float *w1;  /* [num_positions] - delay element 1 for all positions */
+    float *w2;  /* [num_positions] - delay element 2 for all positions */
+} BiquadStateSoA;
+
+/*
  * IIR Temporal Filter context
  */
 typedef struct {
     IIRFilterCoeffs coeffs;     /* Filter coefficients (shared) */
     size_t num_positions;       /* Number of coefficient positions */
-    BiquadState *state;         /* Per-position state [num_positions * num_sections] */
+    BiquadState *state;         /* Per-position state [num_positions * num_sections] (AoS) */
+    BiquadStateSoA *state_soa;  /* Per-section SoA state [num_sections] (SIMD-friendly) */
     int warmup_frames;          /* Frames needed for filter to stabilize */
     int frames_processed;       /* Frames processed so far */
+    bool use_simd;              /* Use AVX-512 optimized path */
 } IIRTemporalFilter;
 
 /*

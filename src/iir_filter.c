@@ -1,5 +1,6 @@
 /*
  * IIR Band-pass Filter Implementation
+ * With AVX-512 SIMD optimization for batch processing
  */
 
 #include "iir_filter.h"
@@ -13,9 +14,20 @@
 #include <omp.h>
 #endif
 
+/* AVX-512 support detection and includes */
+#if defined(__AVX512F__)
+#define USE_AVX512 1
+#include <immintrin.h>
+#else
+#define USE_AVX512 0
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+/* AVX-512 processes 16 floats at once */
+#define SIMD_WIDTH 16
 
 /*
  * Design a 2nd-order Butterworth low-pass biquad section.
@@ -98,16 +110,39 @@ int iir_temporal_init(IIRTemporalFilter *filt, size_t num_positions,
     }
 
     filt->num_positions = num_positions;
+    const int num_sections = filt->coeffs.num_sections;
 
-    /* Allocate state for all positions and sections */
-    size_t state_count = num_positions * filt->coeffs.num_sections;
+#if USE_AVX512
+    /* Allocate SoA state for SIMD processing */
+    filt->state_soa = mem_alloc(num_sections * sizeof(BiquadStateSoA));
+    if (!filt->state_soa) {
+        return -1;
+    }
+
+    /* Allocate aligned arrays for each section's w1 and w2 */
+    for (int s = 0; s < num_sections; s++) {
+        /* Align to 64 bytes for AVX-512 */
+        filt->state_soa[s].w1 = mem_calloc(num_positions + SIMD_WIDTH, sizeof(float));
+        filt->state_soa[s].w2 = mem_calloc(num_positions + SIMD_WIDTH, sizeof(float));
+        if (!filt->state_soa[s].w1 || !filt->state_soa[s].w2) {
+            iir_temporal_free(filt);
+            return -1;
+        }
+    }
+    filt->use_simd = true;
+    filt->state = NULL;  /* Not used in SIMD mode */
+#else
+    /* Allocate AoS state for scalar processing */
+    size_t state_count = num_positions * num_sections;
     filt->state = mem_calloc(state_count, sizeof(BiquadState));
     if (!filt->state) {
         return -1;
     }
+    filt->state_soa = NULL;
+    filt->use_simd = false;
+#endif
 
     /* Warmup time: ~3 time constants of the lowest frequency */
-    /* Time constant ≈ 1/(2*pi*f_low), need ~3 of these */
     filt->warmup_frames = (int)(3.0f * fs / (2.0f * (float)M_PI * f_low));
     if (filt->warmup_frames < 16) filt->warmup_frames = 16;
 
@@ -115,6 +150,14 @@ int iir_temporal_init(IIRTemporalFilter *filt, size_t num_positions,
 }
 
 void iir_temporal_free(IIRTemporalFilter *filt) {
+    if (filt->state_soa) {
+        for (int s = 0; s < filt->coeffs.num_sections; s++) {
+            mem_free(filt->state_soa[s].w1);
+            mem_free(filt->state_soa[s].w2);
+        }
+        mem_free(filt->state_soa);
+        filt->state_soa = NULL;
+    }
     mem_free(filt->state);
     filt->state = NULL;
     filt->num_positions = 0;
@@ -122,7 +165,7 @@ void iir_temporal_free(IIRTemporalFilter *filt) {
 
 /*
  * Apply a single biquad section (Direct Form II Transposed)
- * This form has better numerical properties and is SIMD-friendly.
+ * Scalar version for fallback.
  */
 static inline float biquad_process(const BiquadCoeffs *c, BiquadState *s, float x) {
     float y = c->b0 * x + s->w1;
@@ -135,20 +178,82 @@ void iir_temporal_process(IIRTemporalFilter *filt,
                           const float *input, float *output) {
     const int num_sections = filt->coeffs.num_sections;
     const BiquadCoeffs *coeffs = filt->coeffs.sections;
-    BiquadState *state = filt->state;
     const size_t n = filt->num_positions;
 
-    /* Process each position through the filter cascade */
-    for (size_t i = 0; i < n; i++) {
-        float x = input[i];
+#if USE_AVX512
+    if (filt->use_simd) {
+        BiquadStateSoA *state_soa = filt->state_soa;
+        const size_t n_simd = n & ~(size_t)(SIMD_WIDTH - 1);
 
-        /* Apply each biquad section in series */
-        BiquadState *pos_state = &state[i * num_sections];
-        for (int s = 0; s < num_sections; s++) {
-            x = biquad_process(&coeffs[s], &pos_state[s], x);
+        /* Process 16 positions at a time with AVX-512 */
+        for (size_t i = 0; i < n_simd; i += SIMD_WIDTH) {
+            __m512 x = _mm512_loadu_ps(&input[i]);
+
+            /* Apply each biquad section in series */
+            for (int s = 0; s < num_sections; s++) {
+                const BiquadCoeffs *c = &coeffs[s];
+                BiquadStateSoA *st = &state_soa[s];
+
+                __m512 w1 = _mm512_loadu_ps(&st->w1[i]);
+                __m512 w2 = _mm512_loadu_ps(&st->w2[i]);
+
+                __m512 b0 = _mm512_set1_ps(c->b0);
+                __m512 b1 = _mm512_set1_ps(c->b1);
+                __m512 b2 = _mm512_set1_ps(c->b2);
+                __m512 a1 = _mm512_set1_ps(c->a1);
+                __m512 a2 = _mm512_set1_ps(c->a2);
+
+                /* y = b0 * x + w1 */
+                __m512 y = _mm512_fmadd_ps(b0, x, w1);
+
+                /* new_w1 = b1 * x - a1 * y + w2 */
+                __m512 new_w1 = _mm512_fmadd_ps(b1, x, w2);
+                new_w1 = _mm512_fnmadd_ps(a1, y, new_w1);
+
+                /* new_w2 = b2 * x - a2 * y */
+                __m512 new_w2 = _mm512_mul_ps(b2, x);
+                new_w2 = _mm512_fnmadd_ps(a2, y, new_w2);
+
+                _mm512_storeu_ps(&st->w1[i], new_w1);
+                _mm512_storeu_ps(&st->w2[i], new_w2);
+
+                x = y;  /* Output of this section is input to next */
+            }
+
+            _mm512_storeu_ps(&output[i], x);
         }
 
-        output[i] = x;
+        /* Handle remaining positions with scalar code */
+        for (size_t i = n_simd; i < n; i++) {
+            float x = input[i];
+            for (int s = 0; s < num_sections; s++) {
+                const BiquadCoeffs *c = &coeffs[s];
+                BiquadStateSoA *st = &state_soa[s];
+
+                float w1 = st->w1[i];
+                float w2 = st->w2[i];
+
+                float y = c->b0 * x + w1;
+                st->w1[i] = c->b1 * x - c->a1 * y + w2;
+                st->w2[i] = c->b2 * x - c->a2 * y;
+
+                x = y;
+            }
+            output[i] = x;
+        }
+    } else
+#endif
+    {
+        /* Scalar fallback */
+        BiquadState *state = filt->state;
+        for (size_t i = 0; i < n; i++) {
+            float x = input[i];
+            BiquadState *pos_state = &state[i * num_sections];
+            for (int s = 0; s < num_sections; s++) {
+                x = biquad_process(&coeffs[s], &pos_state[s], x);
+            }
+            output[i] = x;
+        }
     }
 
     filt->frames_processed++;
@@ -159,32 +264,101 @@ void iir_temporal_process_batch(IIRTemporalFilter *filt,
                                 int batch_size) {
     const int num_sections = filt->coeffs.num_sections;
     const BiquadCoeffs *coeffs = filt->coeffs.sections;
-    BiquadState *state = filt->state;
     const size_t n = filt->num_positions;
 
-    /*
-     * Batch processing strategy:
-     * - Outer loop: parallel across positions (independent filter states)
-     * - Inner loop: sequential across frames (maintains IIR state)
-     *
-     * Memory layout: input/output are [batch_size][num_positions] (frame-major)
-     * Access pattern: For position p, frames are at offsets p, n+p, 2n+p, ...
-     */
-    #pragma omp parallel for schedule(static)
-    for (size_t pos = 0; pos < n; pos++) {
-        BiquadState *pos_state = &state[pos * num_sections];
+#if USE_AVX512
+    if (filt->use_simd) {
+        BiquadStateSoA *state_soa = filt->state_soa;
+        const size_t n_simd = n & ~(size_t)(SIMD_WIDTH - 1);
 
-        /* Process all frames for this position sequentially */
-        for (int f = 0; f < batch_size; f++) {
-            size_t idx = (size_t)f * n + pos;
-            float x = input[idx];
+        /*
+         * AVX-512 batch processing:
+         * - Outer loop: positions in chunks of 16 (parallel with OpenMP)
+         * - Middle loop: frames (sequential for IIR state)
+         * - Inner loop: biquad sections (sequential cascade)
+         *
+         * NOTE: 4x loop unrolling was tried but provided no speedup.
+         * The memory bandwidth is the bottleneck, not compute.
+         */
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n_simd; i += SIMD_WIDTH) {
+            /* Process all frames for these 16 positions */
+            for (int f = 0; f < batch_size; f++) {
+                const size_t idx = (size_t)f * n + i;
+                __m512 x = _mm512_loadu_ps(&input[idx]);
 
-            /* Apply each biquad section in series */
-            for (int s = 0; s < num_sections; s++) {
-                x = biquad_process(&coeffs[s], &pos_state[s], x);
+                for (int s = 0; s < num_sections; s++) {
+                    const BiquadCoeffs *c = &coeffs[s];
+                    BiquadStateSoA *st = &state_soa[s];
+
+                    __m512 w1 = _mm512_loadu_ps(&st->w1[i]);
+                    __m512 w2 = _mm512_loadu_ps(&st->w2[i]);
+
+                    __m512 b0 = _mm512_set1_ps(c->b0);
+                    __m512 b1 = _mm512_set1_ps(c->b1);
+                    __m512 b2 = _mm512_set1_ps(c->b2);
+                    __m512 a1 = _mm512_set1_ps(c->a1);
+                    __m512 a2 = _mm512_set1_ps(c->a2);
+
+                    __m512 y = _mm512_fmadd_ps(b0, x, w1);
+                    __m512 new_w1 = _mm512_fmadd_ps(b1, x, w2);
+                    new_w1 = _mm512_fnmadd_ps(a1, y, new_w1);
+                    __m512 new_w2 = _mm512_mul_ps(b2, x);
+                    new_w2 = _mm512_fnmadd_ps(a2, y, new_w2);
+
+                    _mm512_storeu_ps(&st->w1[i], new_w1);
+                    _mm512_storeu_ps(&st->w2[i], new_w2);
+
+                    x = y;
+                }
+
+                _mm512_storeu_ps(&output[idx], x);
             }
+        }
 
-            output[idx] = x;
+        /* Handle remaining positions with scalar code */
+        for (size_t i = n_simd; i < n; i++) {
+            for (int f = 0; f < batch_size; f++) {
+                const size_t idx = (size_t)f * n + i;
+                float x = input[idx];
+
+                for (int s = 0; s < num_sections; s++) {
+                    const BiquadCoeffs *c = &coeffs[s];
+                    BiquadStateSoA *st = &state_soa[s];
+
+                    float w1 = st->w1[i];
+                    float w2 = st->w2[i];
+
+                    float y = c->b0 * x + w1;
+                    st->w1[i] = c->b1 * x - c->a1 * y + w2;
+                    st->w2[i] = c->b2 * x - c->a2 * y;
+
+                    x = y;
+                }
+
+                output[idx] = x;
+            }
+        }
+    } else
+#endif
+    {
+        /* Scalar fallback with OpenMP */
+        BiquadState *state = filt->state;
+
+        #pragma omp parallel for schedule(static)
+        for (size_t pos = 0; pos < n; pos++) {
+            BiquadState *pos_state = &state[pos * num_sections];
+
+            for (int f = 0; f < batch_size; f++) {
+                size_t idx = (size_t)f * n + pos;
+                float x = input[idx];
+
+                for (int s = 0; s < num_sections; s++) {
+                    x = biquad_process(&coeffs[s], &pos_state[s], x);
+                }
+
+                output[idx] = x;
+            }
         }
     }
 
