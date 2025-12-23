@@ -5,6 +5,7 @@
 
 #include "wema.h"
 #include "ffmpeg_io.h"
+#include "async_io.h"
 #include "alloc.h"
 
 #include <stdio.h>
@@ -349,7 +350,7 @@ int main(int argc, char **argv) {
     int ret;
 
     /*========================================================================
-     * Batch processing mode (IIR only, parallel)
+     * Batch processing mode (IIR only, parallel) with async I/O
      *=======================================================================*/
     if (config.use_iir && config.batch_size > 1 && !config.color_mode) {
         /* Initialize batch context */
@@ -365,13 +366,11 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* Allocate frame arrays for batch processing */
-        Frame *frames_in = mem_alloc(config.batch_size * sizeof(Frame));
-        Frame *frames_out = mem_alloc(config.batch_size * sizeof(Frame));
-        if (!frames_in || !frames_out) {
-            fprintf(stderr, "Error: Failed to allocate frame arrays\n");
-            mem_free(frames_in);
-            mem_free(frames_out);
+        /* Initialize async I/O with double-buffering */
+        AsyncIOContext async_ctx;
+        if (async_io_init(&async_ctx, &io_in, &io_out,
+                          config.batch_size, config.verbose) < 0) {
+            fprintf(stderr, "Error: Failed to initialize async I/O\n");
             wema_batch_free(&batch_ctx);
             mem_free(io_out.raw_buffer);
             ffio_close_output(&io_out);
@@ -381,90 +380,48 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* Initialize frames */
-        for (int i = 0; i < config.batch_size; i++) {
-            memset(&frames_in[i], 0, sizeof(Frame));
-            memset(&frames_out[i], 0, sizeof(Frame));
-            if (frame_alloc(&frames_in[i], io_in.width, io_in.height, 3) < 0 ||
-                frame_alloc(&frames_out[i], io_in.width, io_in.height, 3) < 0) {
-                fprintf(stderr, "Error: Failed to allocate batch frames\n");
-                for (int j = 0; j <= i; j++) {
-                    frame_free(&frames_in[j]);
-                    frame_free(&frames_out[j]);
-                }
-                mem_free(frames_in);
-                mem_free(frames_out);
-                wema_batch_free(&batch_ctx);
-                mem_free(io_out.raw_buffer);
-                ffio_close_output(&io_out);
-                wema_free(&ctx);
-                ffio_close_input(&io_in);
-                mem_free(auto_output);
-                return 1;
-            }
-        }
+        /* Async batch processing loop */
+        int slot_idx;
+        int batch_frames;
 
-        /* Batch processing loop */
-        int batch_frames = 0;
-        while ((ret = ffio_read_frame(&io_in, &frames_in[batch_frames])) == 1) {
-            frame_num++;
-            batch_frames++;
+        while ((batch_frames = async_io_get_input_batch(&async_ctx, &slot_idx)) > 0) {
+            Frame *frames_in = async_ctx.slots[slot_idx].frames_in;
+            Frame *frames_out = async_ctx.slots[slot_idx].frames_out;
 
-            /* Process when batch is full */
-            if (batch_frames >= config.batch_size) {
-                int num_out = wema_batch_process(&ctx, &batch_ctx,
-                                                  frames_in, frames_out,
-                                                  batch_frames);
+            frame_num += batch_frames;
 
-                /* Write output frames */
-                for (int i = 0; i < num_out; i++) {
-                    if (ffio_write_frame(&io_out, &frames_out[i]) < 0) {
-                        fprintf(stderr, "Error: Failed to write frame\n");
-                        goto batch_cleanup;
-                    }
-                    output_count++;
-                }
-
-                batch_frames = 0;
-
-                if (config.verbose && frame_num % 100 == 0) {
-                    fprintf(stderr, "\rProcessed %d frames...", frame_num);
-                    fflush(stderr);
-                }
-            }
-        }
-
-        /* Process remaining frames in partial batch */
-        if (batch_frames > 0) {
+            /* Process this batch */
             int num_out = wema_batch_process(&ctx, &batch_ctx,
                                               frames_in, frames_out,
                                               batch_frames);
-            for (int i = 0; i < num_out; i++) {
-                if (ffio_write_frame(&io_out, &frames_out[i]) < 0) {
-                    fprintf(stderr, "Error: Failed to write frame\n");
-                    break;
-                }
-                output_count++;
+
+            /* Mark batch done - writer thread will handle output */
+            async_io_batch_done(&async_ctx, slot_idx, num_out);
+
+            if (config.verbose && frame_num % 100 < config.batch_size) {
+                fprintf(stderr, "\rProcessed %d frames...", frame_num);
+                fflush(stderr);
             }
         }
 
-        if (ret < 0 && batch_frames > 0) {
-            fprintf(stderr, "Error: Failed reading frame %d\n", frame_num + 1);
+        if (batch_frames < 0) {
+            fprintf(stderr, "Error: Failed reading frames\n");
         }
 
-batch_cleanup:
+        /* Wait for all I/O to complete */
+        if (async_io_finish(&async_ctx) < 0) {
+            fprintf(stderr, "Error: I/O error during processing\n");
+        }
+
+        output_count = async_io_frames_written(&async_ctx);
+
         if (config.verbose) {
             fprintf(stderr, "\rProcessed %d frames, output %d frames.\n",
                     frame_num, output_count);
         }
 
-        /* Cleanup batch resources */
-        for (int i = 0; i < config.batch_size; i++) {
-            frame_free(&frames_in[i]);
-            frame_free(&frames_out[i]);
-        }
-        mem_free(frames_in);
-        mem_free(frames_out);
+        /* Cleanup */
+        async_io_free(&async_ctx);
         wema_batch_free(&batch_ctx);
     }
     /*========================================================================

@@ -3,7 +3,7 @@
 
 CC      := gcc
 CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L
-LDFLAGS := -lm
+LDFLAGS := -lm -lpthread
 
 # OpenMP support (can be disabled with NO_OPENMP=1)
 ifndef NO_OPENMP
