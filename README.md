@@ -57,9 +57,9 @@ wema -i input.mp4 -v
 |--------|-------------|---------|
 | `-i, --input <file>` | Input video file (required) | - |
 | `-o, --output <file>` | Output video file | `input.wema.mkv` |
-| `-a, --amp <factor>` | Amplification factor | 50 |
+| `-a, --amp <factor>` | Amplification factor | 120 |
 | `--fl <freq>` | Low frequency cutoff (Hz) | 0.5 |
-| `--fh <freq>` | High frequency cutoff (Hz) | 3.0 |
+| `--fh <freq>` | High frequency cutoff (Hz) | half of input video framerate |
 | `--temporal-window <n>` | Temporal window size (4-256) | 32 |
 | `--no-edge-aware` | Disable edge-aware guided filter | enabled |
 | `--bilateral-filter` | Enable bilateral temporal filtering | disabled |
