@@ -91,6 +91,22 @@ void iir_temporal_process(IIRTemporalFilter *filt,
                           const float *input, float *output);
 
 /*
+ * Process a batch of frames through the IIR filter (parallel).
+ *
+ * This function is optimized for batch processing with OpenMP.
+ * It processes all positions in parallel, with each position processing
+ * its frames sequentially to maintain correct IIR state.
+ *
+ * @param filt          Filter context (contains per-position state)
+ * @param input         Input coefficients [batch_size][num_positions] (frame-major)
+ * @param output        Output filtered delta [batch_size][num_positions] (frame-major)
+ * @param batch_size    Number of frames in this batch
+ */
+void iir_temporal_process_batch(IIRTemporalFilter *filt,
+                                const float *input, float *output,
+                                int batch_size);
+
+/*
  * Check if filter has warmed up (output is valid).
  */
 bool iir_temporal_ready(const IIRTemporalFilter *filt);

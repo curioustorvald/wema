@@ -9,6 +9,10 @@
 #include <string.h>
 #include <stdio.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -148,6 +152,43 @@ void iir_temporal_process(IIRTemporalFilter *filt,
     }
 
     filt->frames_processed++;
+}
+
+void iir_temporal_process_batch(IIRTemporalFilter *filt,
+                                const float *input, float *output,
+                                int batch_size) {
+    const int num_sections = filt->coeffs.num_sections;
+    const BiquadCoeffs *coeffs = filt->coeffs.sections;
+    BiquadState *state = filt->state;
+    const size_t n = filt->num_positions;
+
+    /*
+     * Batch processing strategy:
+     * - Outer loop: parallel across positions (independent filter states)
+     * - Inner loop: sequential across frames (maintains IIR state)
+     *
+     * Memory layout: input/output are [batch_size][num_positions] (frame-major)
+     * Access pattern: For position p, frames are at offsets p, n+p, 2n+p, ...
+     */
+    #pragma omp parallel for schedule(static)
+    for (size_t pos = 0; pos < n; pos++) {
+        BiquadState *pos_state = &state[pos * num_sections];
+
+        /* Process all frames for this position sequentially */
+        for (int f = 0; f < batch_size; f++) {
+            size_t idx = (size_t)f * n + pos;
+            float x = input[idx];
+
+            /* Apply each biquad section in series */
+            for (int s = 0; s < num_sections; s++) {
+                x = biquad_process(&coeffs[s], &pos_state[s], x);
+            }
+
+            output[idx] = x;
+        }
+    }
+
+    filt->frames_processed += batch_size;
 }
 
 bool iir_temporal_ready(const IIRTemporalFilter *filt) {

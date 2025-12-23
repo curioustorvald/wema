@@ -29,8 +29,9 @@ static void print_usage(const char *prog) {
         "  --temporal-window <n>  Temporal window size (default: 32, min:4, max: 256)\n"
         "  --no-edge-aware        Disable edge-aware guided filter\n"
         "  --bilateral-filter     Enable bilateral temporal filtering\n"
-//        "  --haar                 Use Haar wavelet temporal filter (slower)\n"
         "  --color                Enable color mode (amplify color channels)\n"
+        "  --batch <n>            Batch size for parallel processing (default: 64)\n"
+        "  --threads <n>          Number of threads (default: auto)\n"
         "  -v, --verbose          Verbose output\n"
         "  -h, --help             Show this help\n"
         "\n"
@@ -69,6 +70,8 @@ static int parse_args(int argc, char **argv, WemaConfig *config) {
     config->edge_aware = true;       /* Enabled by default */
     config->bilateral_temp = false;   /* Disabled by default */
     config->use_iir = true;          /* IIR filter by default (fast) */
+    config->batch_size = WEMA_BATCH_SIZE_DEF;
+    config->num_threads = 0;         /* 0 = auto-detect */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--input") == 0) {
@@ -163,6 +166,33 @@ static int parse_args(int argc, char **argv, WemaConfig *config) {
         else if (strcmp(argv[i], "--haar") == 0) {
             config->use_iir = false;
         }
+        else if (strcmp(argv[i], "--batch") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: --batch requires an argument\n");
+                return -1;
+            }
+            config->batch_size = atoi(argv[i]);
+            if (config->batch_size < 1) {
+                fprintf(stderr, "Error: batch size must be at least 1\n");
+                return -1;
+            }
+            if (config->batch_size > WEMA_BATCH_SIZE_MAX) {
+                fprintf(stderr, "Error: batch size cannot exceed %d\n",
+                        WEMA_BATCH_SIZE_MAX);
+                return -1;
+            }
+        }
+        else if (strcmp(argv[i], "--threads") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: --threads requires an argument\n");
+                return -1;
+            }
+            config->num_threads = atoi(argv[i]);
+            if (config->num_threads < 0) {
+                fprintf(stderr, "Error: thread count must be non-negative\n");
+                return -1;
+            }
+        }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             exit(0);
@@ -234,6 +264,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  Bilateral temporal: %s\n", config.bilateral_temp ? "enabled" : "disabled");
         fprintf(stderr, "  Edge-aware filter: %s\n", config.edge_aware ? "enabled" : "disabled");
         fprintf(stderr, "  Color mode: %s\n", config.color_mode ? "enabled" : "disabled");
+        if (config.use_iir) {
+            fprintf(stderr, "  Batch size: %d frames\n", config.batch_size);
+            if (config.num_threads > 0) {
+                fprintf(stderr, "  Threads: %d\n", config.num_threads);
+            } else {
+                fprintf(stderr, "  Threads: auto\n");
+            }
+        }
     }
 
     /* Initialize WEMA context */
@@ -305,69 +343,194 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Allocate frames */
-    Frame frame_in = {0};
-    Frame frame_out = {0};
-
-    if (frame_alloc(&frame_in, io_in.width, io_in.height, 3) < 0 ||
-        frame_alloc(&frame_out, io_in.width, io_in.height, 3) < 0) {
-        fprintf(stderr, "Error: Failed to allocate frames\n");
-        frame_free(&frame_in);
-        frame_free(&frame_out);
-        mem_free(io_out.raw_buffer);
-        ffio_close_output(&io_out);
-        wema_free(&ctx);
-        ffio_close_input(&io_in);
-        mem_free(auto_output);
-        return 1;
-    }
-
-    /* Main processing loop */
+    /* Variables for processing */
     int frame_num = 0;
     int output_count = 0;
     int ret;
 
-    while ((ret = ffio_read_frame(&io_in, &frame_in)) == 1) {
-        frame_num++;
+    /*========================================================================
+     * Batch processing mode (IIR only, parallel)
+     *=======================================================================*/
+    if (config.use_iir && config.batch_size > 1 && !config.color_mode) {
+        /* Initialize batch context */
+        WemaBatchContext batch_ctx;
+        if (wema_batch_init(&batch_ctx, &ctx, config.batch_size,
+                            config.num_threads) < 0) {
+            fprintf(stderr, "Error: Failed to initialize batch context\n");
+            mem_free(io_out.raw_buffer);
+            ffio_close_output(&io_out);
+            wema_free(&ctx);
+            ffio_close_input(&io_in);
+            mem_free(auto_output);
+            return 1;
+        }
 
-        /* Process frame */
-        if (wema_process_frame(&ctx, &frame_in, &frame_out) == 0) {
-            if (wema_ready(&ctx)) {
-                if (ffio_write_frame(&io_out, &frame_out) < 0) {
-                    fprintf(stderr, "Error: Failed to write frame %d\n", frame_num);
+        /* Allocate frame arrays for batch processing */
+        Frame *frames_in = mem_alloc(config.batch_size * sizeof(Frame));
+        Frame *frames_out = mem_alloc(config.batch_size * sizeof(Frame));
+        if (!frames_in || !frames_out) {
+            fprintf(stderr, "Error: Failed to allocate frame arrays\n");
+            mem_free(frames_in);
+            mem_free(frames_out);
+            wema_batch_free(&batch_ctx);
+            mem_free(io_out.raw_buffer);
+            ffio_close_output(&io_out);
+            wema_free(&ctx);
+            ffio_close_input(&io_in);
+            mem_free(auto_output);
+            return 1;
+        }
+
+        /* Initialize frames */
+        for (int i = 0; i < config.batch_size; i++) {
+            memset(&frames_in[i], 0, sizeof(Frame));
+            memset(&frames_out[i], 0, sizeof(Frame));
+            if (frame_alloc(&frames_in[i], io_in.width, io_in.height, 3) < 0 ||
+                frame_alloc(&frames_out[i], io_in.width, io_in.height, 3) < 0) {
+                fprintf(stderr, "Error: Failed to allocate batch frames\n");
+                for (int j = 0; j <= i; j++) {
+                    frame_free(&frames_in[j]);
+                    frame_free(&frames_out[j]);
+                }
+                mem_free(frames_in);
+                mem_free(frames_out);
+                wema_batch_free(&batch_ctx);
+                mem_free(io_out.raw_buffer);
+                ffio_close_output(&io_out);
+                wema_free(&ctx);
+                ffio_close_input(&io_in);
+                mem_free(auto_output);
+                return 1;
+            }
+        }
+
+        /* Batch processing loop */
+        int batch_frames = 0;
+        while ((ret = ffio_read_frame(&io_in, &frames_in[batch_frames])) == 1) {
+            frame_num++;
+            batch_frames++;
+
+            /* Process when batch is full */
+            if (batch_frames >= config.batch_size) {
+                int num_out = wema_batch_process(&ctx, &batch_ctx,
+                                                  frames_in, frames_out,
+                                                  batch_frames);
+
+                /* Write output frames */
+                for (int i = 0; i < num_out; i++) {
+                    if (ffio_write_frame(&io_out, &frames_out[i]) < 0) {
+                        fprintf(stderr, "Error: Failed to write frame\n");
+                        goto batch_cleanup;
+                    }
+                    output_count++;
+                }
+
+                batch_frames = 0;
+
+                if (config.verbose && frame_num % 100 == 0) {
+                    fprintf(stderr, "\rProcessed %d frames...", frame_num);
+                    fflush(stderr);
+                }
+            }
+        }
+
+        /* Process remaining frames in partial batch */
+        if (batch_frames > 0) {
+            int num_out = wema_batch_process(&ctx, &batch_ctx,
+                                              frames_in, frames_out,
+                                              batch_frames);
+            for (int i = 0; i < num_out; i++) {
+                if (ffio_write_frame(&io_out, &frames_out[i]) < 0) {
+                    fprintf(stderr, "Error: Failed to write frame\n");
                     break;
                 }
                 output_count++;
             }
         }
 
-        if (config.verbose && frame_num % 100 == 0) {
-            fprintf(stderr, "\rProcessed %d frames...", frame_num);
-            fflush(stderr);
+        if (ret < 0 && batch_frames > 0) {
+            fprintf(stderr, "Error: Failed reading frame %d\n", frame_num + 1);
         }
-    }
 
-    if (ret < 0) {
-        fprintf(stderr, "Error: Failed reading frame %d\n", frame_num + 1);
-    }
-
-    /* Flush remaining frames */
-    while (wema_flush(&ctx, &frame_out) == 0) {
-        if (ffio_write_frame(&io_out, &frame_out) < 0) {
-            fprintf(stderr, "Error: Failed to write flushed frame\n");
-            break;
+batch_cleanup:
+        if (config.verbose) {
+            fprintf(stderr, "\rProcessed %d frames, output %d frames.\n",
+                    frame_num, output_count);
         }
-        output_count++;
-    }
 
-    if (config.verbose) {
-        fprintf(stderr, "\rProcessed %d frames, output %d frames.\n",
-                frame_num, output_count);
+        /* Cleanup batch resources */
+        for (int i = 0; i < config.batch_size; i++) {
+            frame_free(&frames_in[i]);
+            frame_free(&frames_out[i]);
+        }
+        mem_free(frames_in);
+        mem_free(frames_out);
+        wema_batch_free(&batch_ctx);
     }
+    /*========================================================================
+     * Single-frame processing mode (Haar or fallback)
+     *=======================================================================*/
+    else {
+        /* Allocate frames */
+        Frame frame_in = {0};
+        Frame frame_out = {0};
 
-    /* Cleanup */
-    frame_free(&frame_in);
-    frame_free(&frame_out);
+        if (frame_alloc(&frame_in, io_in.width, io_in.height, 3) < 0 ||
+            frame_alloc(&frame_out, io_in.width, io_in.height, 3) < 0) {
+            fprintf(stderr, "Error: Failed to allocate frames\n");
+            frame_free(&frame_in);
+            frame_free(&frame_out);
+            mem_free(io_out.raw_buffer);
+            ffio_close_output(&io_out);
+            wema_free(&ctx);
+            ffio_close_input(&io_in);
+            mem_free(auto_output);
+            return 1;
+        }
+
+        /* Main processing loop */
+        while ((ret = ffio_read_frame(&io_in, &frame_in)) == 1) {
+            frame_num++;
+
+            /* Process frame */
+            if (wema_process_frame(&ctx, &frame_in, &frame_out) == 0) {
+                if (wema_ready(&ctx)) {
+                    if (ffio_write_frame(&io_out, &frame_out) < 0) {
+                        fprintf(stderr, "Error: Failed to write frame %d\n", frame_num);
+                        break;
+                    }
+                    output_count++;
+                }
+            }
+
+            if (config.verbose && frame_num % 100 == 0) {
+                fprintf(stderr, "\rProcessed %d frames...", frame_num);
+                fflush(stderr);
+            }
+        }
+
+        if (ret < 0) {
+            fprintf(stderr, "Error: Failed reading frame %d\n", frame_num + 1);
+        }
+
+        /* Flush remaining frames */
+        while (wema_flush(&ctx, &frame_out) == 0) {
+            if (ffio_write_frame(&io_out, &frame_out) < 0) {
+                fprintf(stderr, "Error: Failed to write flushed frame\n");
+                break;
+            }
+            output_count++;
+        }
+
+        if (config.verbose) {
+            fprintf(stderr, "\rProcessed %d frames, output %d frames.\n",
+                    frame_num, output_count);
+        }
+
+        /* Cleanup */
+        frame_free(&frame_in);
+        frame_free(&frame_out);
+    }
     mem_free(io_out.raw_buffer);
     ffio_close_output(&io_out);
     wema_free(&ctx);

@@ -206,7 +206,36 @@ typedef struct {
     bool    bilateral_temp; /* Default: true (bilateral temporal filtering) */
     bool    color_mode;     /* Default: false (amplify chrominance for blood flow) */
     bool    use_iir;        /* Default: true (use fast IIR filter) */
+
+    int     batch_size;     /* Default: 64, frames per batch for parallel processing */
+    int     num_threads;    /* Default: 0 (auto-detect) */
 } WemaConfig;
+
+/*============================================================================
+ * Batch Processing Context (for parallel processing)
+ *===========================================================================*/
+
+#define WEMA_BATCH_SIZE_DEF 64
+#define WEMA_BATCH_SIZE_MAX 256
+
+typedef struct {
+    int     batch_size;       /* Number of frames per batch */
+    int     num_threads;      /* Thread count for OpenMP */
+    size_t  num_positions;    /* Total DWT coefficient positions */
+
+    /* Batch buffers - frame-major layout [batch_size][num_positions] */
+    float  *coeffs_batch;     /* DWT coefficients for batch */
+    float  *prev_coeffs;      /* Previous frame coefficients (for delta) */
+    float  *delta_batch;      /* Filtered deltas for batch */
+
+    /* Frame buffers */
+    float  *gray_batch;       /* Grayscale frames [batch_size][width*height] */
+    float  *out_batch;        /* Output frames [batch_size][width*height] */
+
+    /* Tracking */
+    int     frames_in_batch;  /* Current frames loaded in batch */
+    int     warmup_frames;    /* IIR warmup counter */
+} WemaBatchContext;
 
 /*============================================================================
  * Function Prototypes - wema.c
@@ -222,6 +251,17 @@ void wema_free(WemaContext *ctx);
 int  wema_process_frame(WemaContext *ctx, const Frame *in, Frame *out);
 int  wema_flush(WemaContext *ctx, Frame *out);
 bool wema_ready(const WemaContext *ctx);
+
+/*============================================================================
+ * Function Prototypes - Batch Processing (wema_batch.c)
+ *===========================================================================*/
+
+int  wema_batch_init(WemaBatchContext *batch, const WemaContext *wema,
+                     int batch_size, int num_threads);
+void wema_batch_free(WemaBatchContext *batch);
+int  wema_batch_process(WemaContext *wema, WemaBatchContext *batch,
+                        const Frame *frames_in, Frame *frames_out,
+                        int frame_count);
 
 /*============================================================================
  * Function Prototypes - Frame utilities

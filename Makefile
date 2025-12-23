@@ -5,6 +5,12 @@ CC      := gcc
 CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L
 LDFLAGS := -lm
 
+# OpenMP support (can be disabled with NO_OPENMP=1)
+ifndef NO_OPENMP
+CFLAGS  += -fopenmp
+LDFLAGS += -fopenmp
+endif
+
 # Directories
 SRCDIR  := src
 OBJDIR  := obj
@@ -82,6 +88,11 @@ help:
 	@echo "  all           - Release build with optimizations (default)"
 	@echo "  debug         - Debug build with AddressSanitizer"
 	@echo "  debug-valgrind- Debug build without sanitizers (for valgrind)"
+	@echo "  profile       - Profile build with frame pointers"
+	@echo "  gprof         - Build for gprof profiling"
 	@echo "  clean         - Remove build artifacts"
 	@echo "  install       - Install to /usr/local/bin"
 	@echo "  help          - Show this help"
+	@echo ""
+	@echo "Options:"
+	@echo "  NO_OPENMP=1   - Disable OpenMP parallelization"
