@@ -222,15 +222,24 @@ typedef struct {
     int     batch_size;       /* Number of frames per batch */
     int     num_threads;      /* Thread count for OpenMP */
     size_t  num_positions;    /* Total DWT coefficient positions */
+    int     width;
+    int     height;
 
     /* Batch buffers - frame-major layout [batch_size][num_positions] */
     float  *coeffs_batch;     /* DWT coefficients for batch */
-    float  *prev_coeffs;      /* Previous frame coefficients (for delta) */
     float  *delta_batch;      /* Filtered deltas for batch */
 
-    /* Frame buffers */
-    float  *gray_batch;       /* Grayscale frames [batch_size][width*height] */
-    float  *out_batch;        /* Output frames [batch_size][width*height] */
+    /* Frame buffers - [batch_size][width*height] */
+    float  *gray_batch;       /* Grayscale input frames */
+    float  *out_batch;        /* Grayscale output frames */
+
+    /* Per-frame DWT structures for parallel processing */
+    DWTCoeffs *dwt_batch;     /* Array of DWT contexts [batch_size] */
+
+    /* Edge-aware smoothing buffers - per-thread for parallel Phase 3 */
+    /* Each thread needs: delta_buf, smooth_buf, guide_buf, work[4] */
+    float  *smooth_buffers;   /* [num_threads][7][width*height] */
+    int     smooth_buf_stride; /* = 7 * width * height */
 
     /* Tracking */
     int     frames_in_batch;  /* Current frames loaded in batch */
