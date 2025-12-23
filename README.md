@@ -7,7 +7,7 @@ WEMA reveals subtle motions in video that are invisible to the naked eye by ampl
 ## Features
 
 - **CDF 9/7 biorthogonal wavelets** - JPEG 2000 wavelet for smooth reconstruction
-- **Temporal bandpass filtering** - Haar wavelet-based frequency isolation
+- **Temporal bandpass filtering** - Frequency isolation using 2nd-order butterworth filter
 - **Bilateral temporal filtering** - Noise reduction while preserving motion coherence
 - **Edge-aware guided filter** - Reduces artifacts at edges during reconstruction
 - **Optimized for throughput** - Vectorization-friendly code with `-Ofast -march=native`
@@ -42,7 +42,7 @@ wema -i input.mp4
 wema -i input.mp4 -o output.mkv -a 100 --fl 0.8 --fh 2.0
 
 # Disable denoising features for raw output
-wema -i input.mp4 --no-bilateral --no-edge-aware
+wema -i input.mp4 --no-edge-aware
 
 # Output to H.264 with quality setting
 wema -i input.mp4 -o output.mp4 --ff-codec libx264 --ff-option '-crf 18'
@@ -62,7 +62,7 @@ wema -i input.mp4 -v
 | `--fh <freq>` | High frequency cutoff (Hz) | 3.0 |
 | `--temporal-window <n>` | Temporal window size (4-256) | 32 |
 | `--no-edge-aware` | Disable edge-aware guided filter | enabled |
-| `--no-bilateral` | Disable bilateral temporal filtering | enabled |
+| `--bilateral-filter` | Enable bilateral temporal filtering | disabled |
 | `--color` | Enable color difference amplification | disabled |
 | `--ff-codec <codec>` | FFmpeg video codec | ffv1 |
 | `--ff-option <opts>` | FFmpeg encoder options | - |
@@ -73,7 +73,7 @@ wema -i input.mp4 -v
 
 1. **Spatial Decomposition** - Each frame is decomposed using a 2D CDF 9/7 discrete wavelet transform into lowpass and highpass subbands (LH, HL, HH) at multiple scales.
 
-2. **Temporal Filtering** - Wavelet coefficients are tracked over time in a sliding window. A Haar wavelet-based temporal bandpass filter isolates motion in the desired frequency range.
+2. **Temporal Filtering** - Wavelet coefficients are tracked over time in a sliding window. A butterworth temporal bandpass filter isolates motion in the desired frequency range.
 
 3. **Bilateral Denoising** - Optionally, temporal samples are weighted by similarity to the current frame, preserving coherent motion while averaging out sensor noise.
 
