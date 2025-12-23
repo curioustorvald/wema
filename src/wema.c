@@ -13,6 +13,7 @@
 #include "wema.h"
 #include "dwt.h"
 #include "temporal_filter.h"
+#include "iir_filter.h"
 #include "phase_amp.h"
 #include "alloc.h"
 
@@ -487,6 +488,106 @@ error:
     return -1;
 }
 
+/* Initialize IIR temporal filter (call after wema_init, replaces Haar) */
+int wema_init_iir(WemaContext *ctx) {
+    size_t num_positions = dwt_num_positions(ctx->coeffs);
+
+    /* Allocate IIR filter for Y channel */
+    ctx->iir_filt = mem_alloc(sizeof(IIRTemporalFilter));
+    if (!ctx->iir_filt) goto error;
+
+    if (iir_temporal_init(ctx->iir_filt, num_positions,
+                          ctx->f_low, ctx->f_high, ctx->fps) < 0) {
+        goto error;
+    }
+
+    /* Allocate previous coefficients buffer for computing delta */
+    ctx->prev_coeffs = mem_calloc(num_positions, sizeof(float));
+    if (!ctx->prev_coeffs) goto error;
+
+    /* Free Haar temporal resources - no longer needed */
+    if (ctx->temporal_buf) {
+        temporal_buffer_free(ctx->temporal_buf);
+        mem_free(ctx->temporal_buf);
+        ctx->temporal_buf = NULL;
+    }
+    if (ctx->temporal_filt) {
+        temporal_filter_free(ctx->temporal_filt);
+        mem_free(ctx->temporal_filt);
+        ctx->temporal_filt = NULL;
+    }
+
+    ctx->use_iir = true;
+    return 0;
+
+error:
+    if (ctx->iir_filt) {
+        iir_temporal_free(ctx->iir_filt);
+        mem_free(ctx->iir_filt);
+        ctx->iir_filt = NULL;
+    }
+    mem_free(ctx->prev_coeffs);
+    ctx->prev_coeffs = NULL;
+    return -1;
+}
+
+/* Initialize IIR filters for color mode chrominance channels */
+int wema_init_iir_color(WemaContext *ctx) {
+    if (!ctx->coeffs_cb || !ctx->coeffs_cr) return -1;
+
+    size_t num_positions = dwt_num_positions(ctx->coeffs_cb);
+
+    /* Allocate IIR filters for Cb and Cr */
+    ctx->iir_filt_cb = mem_alloc(sizeof(IIRTemporalFilter));
+    ctx->iir_filt_cr = mem_alloc(sizeof(IIRTemporalFilter));
+    if (!ctx->iir_filt_cb || !ctx->iir_filt_cr) goto error;
+
+    if (iir_temporal_init(ctx->iir_filt_cb, num_positions,
+                          ctx->f_low, ctx->f_high, ctx->fps) < 0) {
+        goto error;
+    }
+    if (iir_temporal_init(ctx->iir_filt_cr, num_positions,
+                          ctx->f_low, ctx->f_high, ctx->fps) < 0) {
+        goto error;
+    }
+
+    /* Allocate previous coefficient buffers */
+    ctx->prev_coeffs_cb = mem_calloc(num_positions, sizeof(float));
+    ctx->prev_coeffs_cr = mem_calloc(num_positions, sizeof(float));
+    if (!ctx->prev_coeffs_cb || !ctx->prev_coeffs_cr) goto error;
+
+    /* Free Haar temporal resources for chrominance */
+    if (ctx->temporal_buf_cb) {
+        temporal_buffer_free(ctx->temporal_buf_cb);
+        mem_free(ctx->temporal_buf_cb);
+        ctx->temporal_buf_cb = NULL;
+    }
+    if (ctx->temporal_buf_cr) {
+        temporal_buffer_free(ctx->temporal_buf_cr);
+        mem_free(ctx->temporal_buf_cr);
+        ctx->temporal_buf_cr = NULL;
+    }
+
+    return 0;
+
+error:
+    if (ctx->iir_filt_cb) {
+        iir_temporal_free(ctx->iir_filt_cb);
+        mem_free(ctx->iir_filt_cb);
+        ctx->iir_filt_cb = NULL;
+    }
+    if (ctx->iir_filt_cr) {
+        iir_temporal_free(ctx->iir_filt_cr);
+        mem_free(ctx->iir_filt_cr);
+        ctx->iir_filt_cr = NULL;
+    }
+    mem_free(ctx->prev_coeffs_cb);
+    mem_free(ctx->prev_coeffs_cr);
+    ctx->prev_coeffs_cb = NULL;
+    ctx->prev_coeffs_cr = NULL;
+    return -1;
+}
+
 void wema_free(WemaContext *ctx) {
     /* Free Y channel state */
     if (ctx->coeffs) {
@@ -527,6 +628,29 @@ void wema_free(WemaContext *ctx) {
         ctx->temporal_buf_cr = NULL;
     }
 
+    /* Free IIR filter state */
+    if (ctx->iir_filt) {
+        iir_temporal_free(ctx->iir_filt);
+        mem_free(ctx->iir_filt);
+        ctx->iir_filt = NULL;
+    }
+    if (ctx->iir_filt_cb) {
+        iir_temporal_free(ctx->iir_filt_cb);
+        mem_free(ctx->iir_filt_cb);
+        ctx->iir_filt_cb = NULL;
+    }
+    if (ctx->iir_filt_cr) {
+        iir_temporal_free(ctx->iir_filt_cr);
+        mem_free(ctx->iir_filt_cr);
+        ctx->iir_filt_cr = NULL;
+    }
+    mem_free(ctx->prev_coeffs);
+    mem_free(ctx->prev_coeffs_cb);
+    mem_free(ctx->prev_coeffs_cr);
+    ctx->prev_coeffs = NULL;
+    ctx->prev_coeffs_cb = NULL;
+    ctx->prev_coeffs_cr = NULL;
+
     /* Free Y channel work buffers */
     mem_free(ctx->gray_in);
     mem_free(ctx->gray_out);
@@ -561,12 +685,152 @@ void wema_free(WemaContext *ctx) {
 }
 
 bool wema_ready(const WemaContext *ctx) {
+    if (ctx->use_iir) {
+        return ctx->iir_filt && iir_temporal_ready(ctx->iir_filt);
+    }
     return temporal_buffer_ready(ctx->temporal_buf);
+}
+
+/*============================================================================
+ * IIR-mode helper: Extract DWT coefficients to flat array
+ *===========================================================================*/
+
+static void extract_coeffs_to_flat(const DWTCoeffs *coeffs, float *flat) {
+    size_t pos = 0;
+    for (int lev = 0; lev < coeffs->num_levels; lev++) {
+        for (int o = 0; o < WEMA_NUM_ORIENTATIONS; o++) {
+            const Subband *sub = &coeffs->subbands[lev][o];
+            int n = sub->width * sub->height;
+            memcpy(flat + pos, sub->coeffs, n * sizeof(float));
+            pos += n;
+        }
+    }
+}
+
+/*============================================================================
+ * IIR-mode helper: Apply amplified delta back to DWT coefficients
+ *===========================================================================*/
+
+static void apply_amplified_delta(const float *delta, const float *orig,
+                                   float amp_factor, DWTCoeffs *coeffs) {
+    /* Compute coefficient magnitude statistics for thresholding */
+    size_t total_pos = dwt_num_positions(coeffs);
+
+    float mag_sum = 0.0f;
+    for (size_t i = 0; i < total_pos; i++) {
+        mag_sum += fabsf(orig[i]);
+    }
+    const float coeff_threshold = mag_sum / (float)total_pos * 0.2f;
+
+    /* Apply amplification per level */
+    size_t pos = 0;
+    for (int lev = 0; lev < coeffs->num_levels; lev++) {
+        const float level_alpha = amp_factor * ((lev == 0) ? 0.5f : 1.0f);
+
+        for (int o = 0; o < WEMA_NUM_ORIENTATIONS; o++) {
+            Subband *sub = &coeffs->subbands[lev][o];
+            float *out = sub->coeffs;
+            const int n = sub->width * sub->height;
+
+            for (int i = 0; i < n; i++) {
+                const float o_val = orig[pos];
+                const float d_val = delta[pos];
+                const float mask = (fabsf(o_val) > coeff_threshold) ? 1.0f : 0.0f;
+                out[i] = o_val + mask * level_alpha * d_val;
+                pos++;
+            }
+        }
+    }
 }
 
 int wema_process_frame(WemaContext *ctx, const Frame *in, Frame *out) {
     const size_t pixels = (size_t)ctx->width * ctx->height;
 
+    /*========================================================================
+     * IIR Mode: Fast streaming temporal filter
+     *=======================================================================*/
+    if (ctx->use_iir) {
+        if (ctx->color_mode) {
+            /* IIR Color mode: Process Y, Cb, Cr */
+            frame_rgb_to_ycbcr(in, ctx->gray_in, ctx->cb_in, ctx->cr_in);
+
+            /* DWT forward */
+            dwt_forward(ctx->gray_in, ctx->width, ctx->height, ctx->coeffs);
+            dwt_forward(ctx->cb_in, ctx->width, ctx->height, ctx->coeffs_cb);
+            dwt_forward(ctx->cr_in, ctx->width, ctx->height, ctx->coeffs_cr);
+
+            /* Extract coefficients to flat arrays */
+            extract_coeffs_to_flat(ctx->coeffs, ctx->prev_coeffs);
+            extract_coeffs_to_flat(ctx->coeffs_cb, ctx->prev_coeffs_cb);
+            extract_coeffs_to_flat(ctx->coeffs_cr, ctx->prev_coeffs_cr);
+
+            /* IIR temporal filtering */
+            iir_temporal_process(ctx->iir_filt, ctx->prev_coeffs, ctx->delta_phi);
+            iir_temporal_process(ctx->iir_filt_cb, ctx->prev_coeffs_cb, ctx->delta_cb);
+            iir_temporal_process(ctx->iir_filt_cr, ctx->prev_coeffs_cr, ctx->delta_cr);
+
+            /* Check warmup */
+            if (!iir_temporal_ready(ctx->iir_filt)) {
+                memcpy(out->data, in->data, pixels * in->channels * sizeof(float));
+                return 0;
+            }
+
+            /* Apply amplification */
+            apply_amplified_delta(ctx->delta_phi, ctx->prev_coeffs,
+                                   ctx->amp_factor, ctx->coeffs);
+            apply_amplified_delta(ctx->delta_cb, ctx->prev_coeffs_cb,
+                                   ctx->amp_factor * 0.5f, ctx->coeffs_cb);
+            apply_amplified_delta(ctx->delta_cr, ctx->prev_coeffs_cr,
+                                   ctx->amp_factor * 0.5f, ctx->coeffs_cr);
+
+            /* DWT inverse */
+            dwt_inverse(ctx->coeffs, ctx->gray_out);
+            dwt_inverse(ctx->coeffs_cb, ctx->cb_out);
+            dwt_inverse(ctx->coeffs_cr, ctx->cr_out);
+
+            /* YCbCr to RGB */
+            frame_ycbcr_to_rgb(ctx->gray_out, ctx->cb_out, ctx->cr_out, out);
+
+        } else {
+            /* IIR Standard mode: Process luminance only */
+            frame_rgb_to_gray(in, ctx->gray_in);
+
+            /* DWT forward */
+            dwt_forward(ctx->gray_in, ctx->width, ctx->height, ctx->coeffs);
+
+            /* Extract coefficients to flat array */
+            extract_coeffs_to_flat(ctx->coeffs, ctx->prev_coeffs);
+
+            /* IIR temporal filtering */
+            iir_temporal_process(ctx->iir_filt, ctx->prev_coeffs, ctx->delta_phi);
+
+            /* Check warmup */
+            if (!iir_temporal_ready(ctx->iir_filt)) {
+                memcpy(out->data, in->data, pixels * in->channels * sizeof(float));
+                return 0;
+            }
+
+            /* Apply amplification */
+            apply_amplified_delta(ctx->delta_phi, ctx->prev_coeffs,
+                                   ctx->amp_factor, ctx->coeffs);
+
+            /* DWT inverse */
+            dwt_inverse(ctx->coeffs, ctx->gray_out);
+
+            /* Grayscale to RGB with edge-aware smoothing */
+            frame_gray_to_rgb_ex(ctx->gray_out, in, out,
+                                 ctx->delta_buf, ctx->smooth_buf,
+                                 ctx->guide_buf,
+                                 ctx->guided_work[0], ctx->guided_work[1],
+                                 ctx->guided_work[2], ctx->guided_work[3],
+                                 ctx->edge_aware);
+        }
+        return 0;
+    }
+
+    /*========================================================================
+     * Haar Mode: Original wavelet-based temporal filter
+     *=======================================================================*/
     if (ctx->color_mode) {
         /* Color mode: Process Y, Cb, Cr separately */
 

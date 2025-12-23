@@ -10,6 +10,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "iir_filter.h"
+
 /*============================================================================
  * Configuration Constants
  *===========================================================================*/
@@ -110,8 +112,9 @@ typedef struct {
     int    num_levels;      /* DWT decomposition levels */
     int    temporal_window; /* Temporal sliding window size */
     bool   edge_aware;      /* Use edge-aware guided filter */
-    bool   bilateral_temp;  /* Bilateral temporal filtering */
+    bool   bilateral_temp;  /* Bilateral temporal filtering (Haar mode only) */
     bool   color_mode;      /* Process chrominance (Cb/Cr) channels */
+    bool   use_iir;         /* Use IIR filter instead of Haar DWT */
 
     /* Normalized frequencies */
     float  f_low_norm;
@@ -119,14 +122,22 @@ typedef struct {
 
     /* Internal state - luminance (Y) */
     DWTCoeffs      *coeffs;
-    TemporalBuffer *temporal_buf;
-    TemporalFilter *temporal_filt;
+    TemporalBuffer *temporal_buf;      /* Haar mode only */
+    TemporalFilter *temporal_filt;     /* Haar mode only */
 
     /* Internal state - chrominance (Cb, Cr) for color mode */
     DWTCoeffs      *coeffs_cb;
     DWTCoeffs      *coeffs_cr;
-    TemporalBuffer *temporal_buf_cb;
-    TemporalBuffer *temporal_buf_cr;
+    TemporalBuffer *temporal_buf_cb;   /* Haar mode only */
+    TemporalBuffer *temporal_buf_cr;   /* Haar mode only */
+
+    /* IIR temporal filter (alternative to Haar) */
+    IIRTemporalFilter *iir_filt;       /* IIR mode - Y channel */
+    IIRTemporalFilter *iir_filt_cb;    /* IIR mode - Cb channel */
+    IIRTemporalFilter *iir_filt_cr;    /* IIR mode - Cr channel */
+    float             *prev_coeffs;    /* Previous frame coefficients for delta */
+    float             *prev_coeffs_cb;
+    float             *prev_coeffs_cr;
 
     /* Work buffers - luminance */
     float  *gray_in;        /* Y channel input */
@@ -194,6 +205,7 @@ typedef struct {
     bool    edge_aware;     /* Default: true (use guided filter) */
     bool    bilateral_temp; /* Default: true (bilateral temporal filtering) */
     bool    color_mode;     /* Default: false (amplify chrominance for blood flow) */
+    bool    use_iir;        /* Default: true (use fast IIR filter) */
 } WemaConfig;
 
 /*============================================================================
@@ -204,6 +216,8 @@ int  wema_init(WemaContext *ctx, int width, int height, float fps,
                float amp_factor, float f_low, float f_high,
                int temporal_window);
 int  wema_init_color(WemaContext *ctx);  /* Init chrominance for color mode */
+int  wema_init_iir(WemaContext *ctx);    /* Init fast IIR temporal filter */
+int  wema_init_iir_color(WemaContext *ctx); /* Init IIR for color mode */
 void wema_free(WemaContext *ctx);
 int  wema_process_frame(WemaContext *ctx, const Frame *in, Frame *out);
 int  wema_flush(WemaContext *ctx, Frame *out);

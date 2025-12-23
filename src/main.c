@@ -23,13 +23,14 @@ static void print_usage(const char *prog) {
         "  -o, --output <file>    Output video file (default: input.wema.mkv)\n"
         "  -a, --amp <factor>     Amplification factor (default: 50)\n"
         "  --fl <freq>            Low frequency cutoff in Hz (default: 0.5)\n"
-        "  --fh <freq>            High frequency cutoff in Hz (default: 3.0)\n"
+        "  --fh <freq>            High frequency cutoff in Hz (default: 3.0, max: half of framerate)\n"
         "  --ff-codec <codec>     FFmpeg video codec (default: ffv1)\n"
         "  --ff-option <opts>     FFmpeg encoder options\n"
         "  --temporal-window <n>  Temporal window size (default: 32, min:4, max: 256)\n"
         "  --no-edge-aware        Disable edge-aware guided filter\n"
-        "  --no-bilateral         Disable bilateral temporal filtering\n"
-        "  --color                Enable color mode (amplify colour channels)\n"
+        "  --bilateral-filter     Enable bilateral temporal filtering\n"
+//        "  --haar                 Use Haar wavelet temporal filter (slower)\n"
+        "  --color                Enable color mode (amplify color channels)\n"
         "  -v, --verbose          Verbose output\n"
         "  -h, --help             Show this help\n"
         "\n"
@@ -66,7 +67,8 @@ static int parse_args(int argc, char **argv, WemaConfig *config) {
     config->temporal_window = WEMA_TEMPORAL_WINDOW_DEF;
     config->verbose = false;
     config->edge_aware = true;       /* Enabled by default */
-    config->bilateral_temp = true;   /* Enabled by default */
+    config->bilateral_temp = false;   /* Disabled by default */
+    config->use_iir = true;          /* IIR filter by default (fast) */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--input") == 0) {
@@ -152,11 +154,14 @@ static int parse_args(int argc, char **argv, WemaConfig *config) {
         else if (strcmp(argv[i], "--no-edge-aware") == 0) {
             config->edge_aware = false;
         }
-        else if (strcmp(argv[i], "--no-bilateral") == 0) {
-            config->bilateral_temp = false;
+        else if (strcmp(argv[i], "--bilateral-filter") == 0) {
+            config->bilateral_temp = true;
         }
         else if (strcmp(argv[i], "--color") == 0) {
             config->color_mode = true;
+        }
+        else if (strcmp(argv[i], "--haar") == 0) {
+            config->use_iir = false;
         }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
@@ -208,6 +213,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Clamp f_high to nyquist frequency */
+    if (config.f_high > io_in.fps / 2.0f - 0.0001f) {
+        config.f_high = io_in.fps / 2.0f - 0.0001f;
+    }
+
     if (config.verbose) {
         fprintf(stderr, "Input: %s\n", config.input_path);
         fprintf(stderr, "  Size: %dx%d\n", io_in.width, io_in.height);
@@ -220,6 +230,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  Amplification: %.1f\n", config.amp_factor);
         fprintf(stderr, "  Frequency band: %.2f - %.2f Hz\n", config.f_low, config.f_high);
         fprintf(stderr, "  Temporal window: %d frames\n", config.temporal_window);
+        fprintf(stderr, "  Temporal filter: %s\n", config.use_iir ? "IIR (fast)" : "Haar wavelet");
         fprintf(stderr, "  Bilateral temporal: %s\n", config.bilateral_temp ? "enabled" : "disabled");
         fprintf(stderr, "  Edge-aware filter: %s\n", config.edge_aware ? "enabled" : "disabled");
         fprintf(stderr, "  Color mode: %s\n", config.color_mode ? "enabled" : "disabled");
@@ -247,6 +258,27 @@ int main(int argc, char **argv) {
             ffio_close_input(&io_in);
             mem_free(auto_output);
             return 1;
+        }
+    }
+
+    /* Initialize IIR temporal filter (fast mode, default) */
+    if (config.use_iir) {
+        if (wema_init_iir(&ctx) < 0) {
+            fprintf(stderr, "Error: Failed to initialize IIR filter\n");
+            wema_free(&ctx);
+            ffio_close_input(&io_in);
+            mem_free(auto_output);
+            return 1;
+        }
+        /* Initialize IIR for color channels if color mode enabled */
+        if (config.color_mode) {
+            if (wema_init_iir_color(&ctx) < 0) {
+                fprintf(stderr, "Error: Failed to initialize IIR color filter\n");
+                wema_free(&ctx);
+                ffio_close_input(&io_in);
+                mem_free(auto_output);
+                return 1;
+            }
         }
     }
 

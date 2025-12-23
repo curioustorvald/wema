@@ -34,6 +34,17 @@ debug: $(TARGET)
 debug-valgrind: CFLAGS += -g -O0
 debug-valgrind: $(TARGET)
 
+# Profile build: -Ofast with frame pointers for perf
+.PHONY: profile
+profile: CFLAGS += -Ofast -DNDEBUG -march=native -fno-omit-frame-pointer -g
+profile: $(TARGET)
+
+# Gprof profile build: -Ofast with -pg
+.PHONY: gprof
+gprof: CFLAGS += -Ofast -DNDEBUG -march=native -pg -g
+gprof: LDFLAGS += -pg
+gprof: $(TARGET)
+
 # Create directories
 $(OBJDIR):
 	mkdir -p $(OBJDIR)

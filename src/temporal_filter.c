@@ -250,23 +250,23 @@ void temporal_filter_apply(const TemporalFilter *filt,
         for (int t = 0; t < ws; t++) {
             temp[t] -= mean;
         }
-
-        /* Apply temporal DWT */
-        haar_dwt_1d(temp, ws, haar_work);
-
-        /* Zero out DC and unwanted scales */
-        temp[0] = 0.0f;
-        int level_start = 1;
-        for (int j = num_levels - 1; j >= 0; j--) {
-            int level_size = 1 << j;
-            if (!keep_level[j]) {
-                memset(temp + level_start, 0, level_size * sizeof(float));
-            }
-            level_start += level_size;
-        }
-
-        /* Inverse DWT */
-        haar_idwt_1d(temp, ws, haar_work);
+//
+//        /* Apply temporal DWT */
+//        haar_dwt_1d(temp, ws, haar_work);
+//
+//        /* Zero out DC and unwanted scales */
+//        temp[0] = 0.0f;
+//        int level_start = 1;
+//        for (int j = num_levels - 1; j >= 0; j--) {
+//            int level_size = 1 << j;
+//            if (!keep_level[j]) {
+//                memset(temp + level_start, 0, level_size * sizeof(float));
+//            }
+//            level_start += level_size;
+//        }
+//
+//        /* Inverse DWT */
+//        haar_idwt_1d(temp, ws, haar_work);
 
         if (bilateral) {
             /* Re-extract original for bilateral weighting */
