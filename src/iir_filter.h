@@ -122,4 +122,15 @@ void iir_temporal_process_batch(IIRTemporalFilter *filt,
  */
 bool iir_temporal_ready(const IIRTemporalFilter *filt);
 
+/*
+ * Pre-seed the filter with initial coefficients to eliminate warmup transient.
+ * Call this once before processing with the first frame's DWT coefficients.
+ * The filter will be run for warmup_frames iterations with this input,
+ * bringing it to a stable state so output is valid from frame 1.
+ *
+ * @param filt          Filter context
+ * @param initial_coeffs First frame's DWT coefficients [num_positions]
+ */
+void iir_temporal_preseed(IIRTemporalFilter *filt, const float *initial_coeffs);
+
 #endif /* IIR_FILTER_H */

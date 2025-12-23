@@ -142,9 +142,13 @@ int iir_temporal_init(IIRTemporalFilter *filt, size_t num_positions,
     filt->use_simd = false;
 #endif
 
-    /* Warmup time: ~3 time constants of the lowest frequency */
-    filt->warmup_frames = (int)(3.0f * fs / (2.0f * (float)M_PI * f_low));
-    if (filt->warmup_frames < 16) filt->warmup_frames = 16;
+    /*
+     * Warmup time: time constants of the lowest frequency.
+     * 3τ = 95% settled, 5τ = 99.3%, 7τ = 99.9%
+     * With high amplification factors, we need more settling.
+     */
+    filt->warmup_frames = (int)(7.0f * fs / (2.0f * (float)M_PI * f_low));
+    if (filt->warmup_frames < 30) filt->warmup_frames = 30;
 
     return 0;
 }
@@ -367,4 +371,101 @@ void iir_temporal_process_batch(IIRTemporalFilter *filt,
 
 bool iir_temporal_ready(const IIRTemporalFilter *filt) {
     return filt->frames_processed >= filt->warmup_frames;
+}
+
+void iir_temporal_preseed(IIRTemporalFilter *filt, const float *initial_coeffs) {
+    if (filt->frames_processed > 0) {
+        return;  /* Already processing, don't re-seed */
+    }
+
+    const int num_sections = filt->coeffs.num_sections;
+    const BiquadCoeffs *coeffs = filt->coeffs.sections;
+    const size_t n = filt->num_positions;
+    const int warmup = filt->warmup_frames;
+
+    /*
+     * Feed the initial coefficients through the filter repeatedly
+     * to bring it to steady state. This eliminates startup transient.
+     */
+#if USE_AVX512
+    if (filt->use_simd) {
+        BiquadStateSoA *state_soa = filt->state_soa;
+        const size_t n_simd = n & ~(size_t)(SIMD_WIDTH - 1);
+
+        for (int iter = 0; iter < warmup; iter++) {
+            /* SIMD path */
+            for (size_t i = 0; i < n_simd; i += SIMD_WIDTH) {
+                __m512 x = _mm512_loadu_ps(&initial_coeffs[i]);
+
+                for (int s = 0; s < num_sections; s++) {
+                    const BiquadCoeffs *c = &coeffs[s];
+                    BiquadStateSoA *st = &state_soa[s];
+
+                    __m512 w1 = _mm512_loadu_ps(&st->w1[i]);
+                    __m512 w2 = _mm512_loadu_ps(&st->w2[i]);
+
+                    __m512 b0 = _mm512_set1_ps(c->b0);
+                    __m512 b1 = _mm512_set1_ps(c->b1);
+                    __m512 b2 = _mm512_set1_ps(c->b2);
+                    __m512 a1 = _mm512_set1_ps(c->a1);
+                    __m512 a2 = _mm512_set1_ps(c->a2);
+
+                    __m512 y = _mm512_fmadd_ps(b0, x, w1);
+                    __m512 new_w1 = _mm512_fmadd_ps(b1, x, w2);
+                    new_w1 = _mm512_fnmadd_ps(a1, y, new_w1);
+                    __m512 new_w2 = _mm512_mul_ps(b2, x);
+                    new_w2 = _mm512_fnmadd_ps(a2, y, new_w2);
+
+                    _mm512_storeu_ps(&st->w1[i], new_w1);
+                    _mm512_storeu_ps(&st->w2[i], new_w2);
+
+                    x = y;
+                }
+            }
+
+            /* Scalar remainder */
+            for (size_t i = n_simd; i < n; i++) {
+                float x = initial_coeffs[i];
+                for (int s = 0; s < num_sections; s++) {
+                    const BiquadCoeffs *c = &coeffs[s];
+                    BiquadStateSoA *st = &state_soa[s];
+
+                    float w1 = st->w1[i];
+                    float w2 = st->w2[i];
+
+                    float y = c->b0 * x + w1;
+                    st->w1[i] = c->b1 * x - c->a1 * y + w2;
+                    st->w2[i] = c->b2 * x - c->a2 * y;
+
+                    x = y;
+                }
+            }
+        }
+    } else
+#endif
+    {
+        /* Scalar fallback */
+        BiquadState *state = filt->state;
+
+        for (int iter = 0; iter < warmup; iter++) {
+            for (size_t i = 0; i < n; i++) {
+                float x = initial_coeffs[i];
+                BiquadState *pos_state = &state[i * num_sections];
+
+                for (int s = 0; s < num_sections; s++) {
+                    const BiquadCoeffs *c = &coeffs[s];
+                    BiquadState *st = &pos_state[s];
+
+                    float y = c->b0 * x + st->w1;
+                    st->w1 = c->b1 * x - c->a1 * y + st->w2;
+                    st->w2 = c->b2 * x - c->a2 * y;
+
+                    x = y;
+                }
+            }
+        }
+    }
+
+    /* Mark as warmed up */
+    filt->frames_processed = warmup;
 }

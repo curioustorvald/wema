@@ -764,24 +764,39 @@ int wema_process_frame(WemaContext *ctx, const Frame *in, Frame *out) {
             extract_coeffs_to_flat(ctx->coeffs_cb, ctx->prev_coeffs_cb);
             extract_coeffs_to_flat(ctx->coeffs_cr, ctx->prev_coeffs_cr);
 
+            /* Pre-seed IIR filters on first frame */
+            if (ctx->iir_filt->frames_processed == 0) {
+                iir_temporal_preseed(ctx->iir_filt, ctx->prev_coeffs);
+                iir_temporal_preseed(ctx->iir_filt_cb, ctx->prev_coeffs_cb);
+                iir_temporal_preseed(ctx->iir_filt_cr, ctx->prev_coeffs_cr);
+            }
+
+            /* Track frame for fade-in */
+            const int frame_before = ctx->iir_filt->frames_processed;
+
             /* IIR temporal filtering */
             iir_temporal_process(ctx->iir_filt, ctx->prev_coeffs, ctx->delta_phi);
             iir_temporal_process(ctx->iir_filt_cb, ctx->prev_coeffs_cb, ctx->delta_cb);
             iir_temporal_process(ctx->iir_filt_cr, ctx->prev_coeffs_cr, ctx->delta_cr);
 
-            /* Check warmup */
-            if (!iir_temporal_ready(ctx->iir_filt)) {
-                memcpy(out->data, in->data, pixels * in->channels * sizeof(float));
-                return 0;
+            /* Short fade-in after preseed */
+            const int fade_in_frames = 15;
+            const int global_frame = frame_before - ctx->iir_filt->warmup_frames;
+            float amp = ctx->amp_factor;
+            if (global_frame < 0) {
+                amp = 0.0f;
+            } else if (global_frame < fade_in_frames) {
+                float t = (float)(global_frame + 1) / (float)fade_in_frames;
+                amp = ctx->amp_factor * t * t;
             }
 
             /* Apply amplification */
             apply_amplified_delta(ctx->delta_phi, ctx->prev_coeffs,
-                                   ctx->amp_factor, ctx->coeffs);
+                                   amp, ctx->coeffs);
             apply_amplified_delta(ctx->delta_cb, ctx->prev_coeffs_cb,
-                                   ctx->amp_factor * 0.5f, ctx->coeffs_cb);
+                                   amp * 0.5f, ctx->coeffs_cb);
             apply_amplified_delta(ctx->delta_cr, ctx->prev_coeffs_cr,
-                                   ctx->amp_factor * 0.5f, ctx->coeffs_cr);
+                                   amp * 0.5f, ctx->coeffs_cr);
 
             /* DWT inverse */
             dwt_inverse(ctx->coeffs, ctx->gray_out);
@@ -801,18 +816,31 @@ int wema_process_frame(WemaContext *ctx, const Frame *in, Frame *out) {
             /* Extract coefficients to flat array */
             extract_coeffs_to_flat(ctx->coeffs, ctx->prev_coeffs);
 
+            /* Pre-seed IIR filter on first frame */
+            if (ctx->iir_filt->frames_processed == 0) {
+                iir_temporal_preseed(ctx->iir_filt, ctx->prev_coeffs);
+            }
+
+            /* Track frame for fade-in */
+            const int frame_before = ctx->iir_filt->frames_processed;
+
             /* IIR temporal filtering */
             iir_temporal_process(ctx->iir_filt, ctx->prev_coeffs, ctx->delta_phi);
 
-            /* Check warmup */
-            if (!iir_temporal_ready(ctx->iir_filt)) {
-                memcpy(out->data, in->data, pixels * in->channels * sizeof(float));
-                return 0;
+            /* Short fade-in after preseed (15 frames) */
+            const int fade_in_frames = 15;
+            const int global_frame = frame_before - ctx->iir_filt->warmup_frames;
+            float amp = ctx->amp_factor;
+            if (global_frame < 0) {
+                amp = 0.0f;
+            } else if (global_frame < fade_in_frames) {
+                float t = (float)(global_frame + 1) / (float)fade_in_frames;
+                amp = ctx->amp_factor * t * t;
             }
 
             /* Apply amplification */
             apply_amplified_delta(ctx->delta_phi, ctx->prev_coeffs,
-                                   ctx->amp_factor, ctx->coeffs);
+                                   amp, ctx->coeffs);
 
             /* DWT inverse */
             dwt_inverse(ctx->coeffs, ctx->gray_out);

@@ -22,9 +22,9 @@ static void print_usage(const char *prog) {
         "Options:\n"
         "  -i, --input <file>     Input video file (required)\n"
         "  -o, --output <file>    Output video file (default: input.wema.mkv)\n"
-        "  -a, --amp <factor>     Amplification factor (default: 50)\n"
+        "  -a, --amp <factor>     Amplification factor (default: 120)\n"
         "  --fl <freq>            Low frequency cutoff in Hz (default: 0.5)\n"
-        "  --fh <freq>            High frequency cutoff in Hz (default: 3.0, max: half of framerate)\n"
+        "  --fh <freq>            High frequency cutoff in Hz (default/max: half of framerate)\n"
         "  --ff-codec <codec>     FFmpeg video codec (default: ffv1)\n"
         "  --ff-option <opts>     FFmpeg encoder options\n"
         "  --temporal-window <n>  Temporal window size (default: 32, min:4, max: 256)\n"
@@ -63,9 +63,9 @@ static char *generate_output_path(const char *input) {
 static int parse_args(int argc, char **argv, WemaConfig *config) {
     /* Set defaults */
     memset(config, 0, sizeof(*config));
-    config->amp_factor = 50.0f;
+    config->amp_factor = 120.0f;
     config->f_low = 0.5f;
-    config->f_high = 3.0f;
+    config->f_high = 1048576.0f;
     config->temporal_window = WEMA_TEMPORAL_WINDOW_DEF;
     config->verbose = false;
     config->edge_aware = true;       /* Enabled by default */
@@ -449,15 +449,13 @@ int main(int argc, char **argv) {
         while ((ret = ffio_read_frame(&io_in, &frame_in)) == 1) {
             frame_num++;
 
-            /* Process frame */
+            /* Process frame (outputs passthrough during warmup to maintain A/V sync) */
             if (wema_process_frame(&ctx, &frame_in, &frame_out) == 0) {
-                if (wema_ready(&ctx)) {
-                    if (ffio_write_frame(&io_out, &frame_out) < 0) {
-                        fprintf(stderr, "Error: Failed to write frame %d\n", frame_num);
-                        break;
-                    }
-                    output_count++;
+                if (ffio_write_frame(&io_out, &frame_out) < 0) {
+                    fprintf(stderr, "Error: Failed to write frame %d\n", frame_num);
+                    break;
                 }
+                output_count++;
             }
 
             if (config.verbose && frame_num % 100 == 0) {

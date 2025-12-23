@@ -383,33 +383,56 @@ int wema_batch_process(WemaContext *wema, WemaBatchContext *batch,
     }
 
     /*========================================================================
-     * PHASE 2: Temporal IIR filtering (parallel across positions)
+     * PHASE 2: Pre-seed IIR filter on first batch to eliminate warmup
+     *=======================================================================*/
+    const bool is_first_batch = (wema->iir_filt->frames_processed == 0);
+    if (is_first_batch) {
+        /* Use first frame's coefficients to pre-seed the filter */
+        iir_temporal_preseed(wema->iir_filt, batch->coeffs_batch);
+    }
+
+    /* Track frame numbers for fade-in calculation */
+    const int frames_before = wema->iir_filt->frames_processed;
+
+    /*========================================================================
+     * PHASE 3: Temporal IIR filtering (parallel across positions)
      *=======================================================================*/
     iir_temporal_process_batch(wema->iir_filt,
                                batch->coeffs_batch,
                                batch->delta_batch,
                                frame_count);
 
-    /* Compute valid output range based on warmup */
-    const int warmup_done = wema->iir_filt->warmup_frames;
-    const int frames_start = wema->iir_filt->frames_processed - frame_count;
-    int valid_start = (frames_start < warmup_done) ? (warmup_done - frames_start) : 0;
-    if (valid_start > frame_count) valid_start = frame_count;
-
-    const int valid_count = frame_count - valid_start;
+    /*
+     * Short fade-in after preseed to hide any remaining transient.
+     * Even with 7τ warmup, there's ~0.1% residual which at 120x amp is visible.
+     * Use 15-frame quadratic ease-in to smoothly ramp up amplification.
+     */
+    const int fade_in_frames = 15;
+    const int warmup_end = wema->iir_filt->warmup_frames;
 
     /*========================================================================
-     * PHASE 3: Amplification + IDWT + Edge-aware smoothing (parallel)
+     * PHASE 4: Amplification + IDWT + Edge-aware smoothing (parallel)
      *=======================================================================*/
     #pragma omp parallel for schedule(static)
-    for (int i = 0; i < valid_count; i++) {
-        const int f = valid_start + i;
+    for (int f = 0; f < frame_count; f++) {
         const Frame *in = &frames_in[f];
-        Frame *out = &frames_out[i];
+        Frame *out = &frames_out[f];
         const float *coeffs = batch->coeffs_batch + f * num_pos;
         const float *delta = batch->delta_batch + f * num_pos;
         float *gray_out = batch->out_batch + f * pixels;
         DWTCoeffs *dwt = &batch->dwt_batch[f];
+
+        /* Compute frame's global index (after warmup) */
+        const int global_frame = frames_before + f - warmup_end;
+
+        /* Fade-in amplification for first few frames after preseed */
+        float amp = wema->amp_factor;
+        if (global_frame < 0) {
+            amp = 0.0f;  /* Should not happen with preseed, but safety */
+        } else if (global_frame < fade_in_frames) {
+            float t = (float)(global_frame + 1) / (float)fade_in_frames;
+            amp = wema->amp_factor * t * t;  /* Quadratic ease-in */
+        }
 
         /* Get per-thread work buffer for smoothing */
 #ifdef _OPENMP
@@ -420,7 +443,7 @@ int wema_batch_process(WemaContext *wema, WemaBatchContext *batch,
         float *work = batch->smooth_buffers + tid * batch->smooth_buf_stride;
 
         /* Apply amplified delta to DWT coefficients */
-        apply_delta_to_coeffs(delta, coeffs, wema->amp_factor, dwt, num_pos);
+        apply_delta_to_coeffs(delta, coeffs, amp, dwt, num_pos);
 
         /* IDWT (each frame has its own DWT context) */
         dwt_inverse(dwt, gray_out);
@@ -429,5 +452,6 @@ int wema_batch_process(WemaContext *wema, WemaBatchContext *batch,
         gray_to_rgb_edge_aware(gray_out, in, out->data, w, h, work);
     }
 
-    return valid_count;
+    /* Return ALL frames to maintain A/V sync */
+    return frame_count;
 }
