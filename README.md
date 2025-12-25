@@ -1,8 +1,10 @@
-# WEMA - Wavelet-based Eulerian Motion Amplification
+# WEMA — Wavelet-based Eulerian Motion Amplification
 
 A pure C implementation of Eulerian video motion amplification using 2D discrete wavelet transforms.
 
 WEMA reveals subtle motions in video that are invisible to the naked eye by amplifying small temporal variations in wavelet coefficients within a user-specified frequency band.
+
+Watch Video Demo: https://www.youtube.com/watch?v=bhl2Wwm_QOU
 
 ## Features
 
